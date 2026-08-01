@@ -5,6 +5,7 @@ Pure functions: no network, no LLM, no framework. Fully unit-testable.
 
 from __future__ import annotations
 
+import re
 from statistics import fmean, median
 
 from concierge.enums import Availability, PriceTier
@@ -130,11 +131,44 @@ def _option_values(product: Product, *names: str) -> list[str]:
     return []
 
 
+# Catalogs write sizes as "M" / "Medium" / "m", shoppers say "medium" — compare
+# canonical forms so a real match isn't missed (which would wrongly mark every
+# product as "your size unavailable").
+_SIZE_ALIASES: dict[str, set[str]] = {
+    "xs": {"xs", "xsmall", "extrasmall"},
+    "s": {"s", "small"},
+    "m": {"m", "med", "medium"},
+    "l": {"l", "large"},
+    "xl": {"xl", "xlarge", "extralarge"},
+    "2xl": {"2xl", "xxl", "xxlarge", "2x"},
+    "3xl": {"3xl", "xxxl", "3x"},
+}
+
+
+def _canonical_size(raw: str) -> str:
+    key = re.sub(r"[^a-z0-9]", "", raw.lower())
+    for canonical, aliases in _SIZE_ALIASES.items():
+        if key in aliases:
+            return canonical
+    return key
+
+
+def _requested_size_forms(requested: str) -> set[str]:
+    """Canonical forms to match on, incl. each token ("men's medium" -> m)."""
+    forms = {_canonical_size(requested)}
+    forms.update(_canonical_size(tok) for tok in re.split(r"[\s,/]+", requested) if tok)
+    return {f for f in forms if f}
+
+
 def _size_available(product: Product, requested: str | None) -> bool | None:
+    """True/False if the shopper's size is offered; None when it can't be judged."""
     if not requested:
         return None
-    wanted = requested.strip().lower()
-    return any(v.strip().lower() == wanted for v in _option_values(product, "size"))
+    offered = _option_values(product, "size")
+    if not offered:
+        return None  # no size data at all — unknown, not "unavailable"
+    wanted = _requested_size_forms(requested)
+    return any(_canonical_size(value) in wanted for value in offered)
 
 
 def logistics_features(

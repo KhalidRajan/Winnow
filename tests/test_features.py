@@ -144,3 +144,26 @@ def test_logistics_requested_size_availability():
     }
     assert feats["has"].requested_size_available is True
     assert feats["lacks"].requested_size_available is False
+
+
+def test_requested_size_matches_word_and_abbreviation_forms():
+    from concierge.features import logistics_features
+
+    # Catalog writes "M"; shopper says "medium" / "men's medium".
+    products = [_product_with_options("a", availability=True, sizes=["S", "M", "L"])]
+    for requested in ("medium", "M", "men's medium", "Med"):
+        feats = logistics_features(products, Query(raw_text="x", size=requested))
+        assert feats[0].requested_size_available is True, requested
+
+    # A size genuinely not offered still reads False.
+    feats = logistics_features(products, Query(raw_text="x", size="XXL"))
+    assert feats[0].requested_size_available is False
+
+
+def test_requested_size_unknown_when_product_lists_no_sizes():
+    from concierge.features import logistics_features
+
+    # No size options at all -> None ("can't tell"), never False.
+    products = [_product_with_options("a", availability=True, colors=["red"])]
+    feats = logistics_features(products, Query(raw_text="x", size="M"))
+    assert feats[0].requested_size_available is None

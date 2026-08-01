@@ -78,7 +78,12 @@ def collect_query_llm(
     first_message = ""
     state = IntakeState()
     for _ in range(max_turns):
-        user_message = read("> ").strip()
+        try:
+            user_message = read("> ").strip()
+        except EOFError:
+            # Ctrl-D (or piped input running out): search with what we have.
+            write("")
+            break
         if not first_message:
             first_message = user_message
         transcript.append(f"Shopper: {user_message}")

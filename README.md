@@ -1,26 +1,56 @@
-# Multi-Agent Shopping Concierge
+# Winnow
 
-Takes a natural-language shopping query, searches the **Shopify Global Catalog** across all
-Shopify merchants, and has specialized agents evaluate the results before producing a ranked,
-reasoned shortlist.
+Winnows thousands of Shopify products down to the handful worth buying. Chat about what you
+want, and specialized agents search the **Shopify Global Catalog** across all Shopify merchants,
+debate the trade-offs, and return a ranked shortlist with reasons.
 
 ```bash
-python -m concierge.cli 'waterproof hiking jacket under $200, shipping to Canada'
+python -m concierge.cli -i
 ```
 
 ```
-1. Men's Ampli-Dry™ II Waterproof Hiking Shell Jacket
-   105.00 USD   final score 0.85  ████████··
-     budget    0.88 ███████·
-     logistics 0.82 ███████·
-   → [budget] $105 low tier at 22nd percentile, strong value hiking shell
-     [logistics] In-stock, ships to Canada, 4 sizes and 4 colors give broad assortment
-   https://www.rainoutdoors.ie/products/mens-ampli-dry-ii-...
+🛍  Shopping Concierge — tell me what you're after. (Ctrl-D or 'done' to search.)
+
+> I need a rain jacket for hiking
+Great choice! What's your budget cap, and which country should we ship to?
+> around $150, ship to Canada, men's medium
+Perfect, a men's medium hiking rain jacket up to $150 shipped to Canada. Any color
+preference, and does budget or availability matter more to you?
+> availability matters more
+Got it — availability first. Any color preference for the jacket?
+> ^D
+
+Searching…
+
+1. Cielo Rain Jacket - Women's
+   155.00 USD   final score 0.84  ████████··
+     budget    0.40 ███·····
+     logistics 0.95 ████████
+   → [budget] Over budget but low tier and 22nd percentile at $155
+     [logistics] In stock, size available, broad 11 sizes & 8 colors, ships
+   ⚖ logistics rates this 0.95 but budget only 0.40
+   https://www.cotopaxi.com/products/cielo-rain-jacket-womens?variant=40697518882877
+
+2. Highlander Stow & Go Pack Away Waterproof And Windproof Jacket
+   44.00 USD   final score 0.84  ████████··
+     budget    1.00 ████████
+     logistics 0.80 ██████··
+   → [budget] Within budget, lowest price $44 at 0 percentile — best value
+     [logistics] In stock, size available, 7 sizes, ships; 0 colors recorded
+   https://www.preppersshop.co.uk/products/highlander-stow-go-pack-away-waterproof-jacket
 ```
+
+Note the two products tie at 0.84 for opposite reasons — one is cheap, the other has the
+assortment — and the `⚖` line surfaces exactly where the agents disagreed. That reasoning trail
+is the point of the project.
 
 ## How it works
 
-Pipeline: **`search → parallel(budget, logistics) → weighted consensus → reasoning`**
+Pipeline: **`intake → search → parallel(budget, logistics) → [debate] → weighted consensus`**
+
+An **intake agent** turns the conversation into a structured query (product, budget, destination,
+priority, plus product-appropriate attributes). Then the evaluators score in parallel, optionally
+debate what they disagree on, and a deterministic weighted vote produces the shortlist.
 
 The central design decision is **hybrid scoring — facts are computed, judgment is reasoned:**
 
@@ -146,8 +176,10 @@ The default is the recommended path — deterministic consensus keeps the weight
 
 **Testing tiers** mirror the hybrid design:
 
-- **Features & consensus** — pure, asserted *exactly*.
-- **Agents & workflow** — schema/wiring conformance with a stub model (no network, no key).
+- **Features, consensus & debate** — pure, asserted *exactly* (percentiles, tiers, size matching,
+  weighted sums, convergence).
+- **Agents, intake & workflow** — schema/wiring conformance driven by a fake agent, so the whole
+  conversation and pipeline are tested with no network and no key.
 - **Scoring sanity** — the opt-in `@pytest.mark.eval` suite calls a real model and asserts
   *tolerant* properties (e.g. cheapest ≥ priciest on budget), never exact ordering.
 
@@ -155,18 +187,24 @@ The default is the recommended path — deterministic consensus keeps the weight
 
 ```
 src/concierge/
-  config.py models.py enums.py    # settings + typed domain (framework-independent core)
-  features.py consensus.py        #   deterministic facts + weighted vote (pure)
-  auth.py mcp_client.py catalog.py#   Global Catalog transport + search
-  model_factory.py                # \
-  agents/ (base, budget, logistics)#  | the only Agno-dependent modules
-  workflow.py                     # /
-  formatting.py cli.py            # terminal render + entry point
-scripts/smoke_search.py           # manual one-shot live search
+  config.py  models.py  enums.py     # settings + typed domain
+  features.py  consensus.py          # deterministic facts + weighted vote (pure)
+  debate.py                          # debate loop over per-agent "reviser" callables (pure)
+  interactive.py                     # conversational intake loop (agent injected)
+  auth.py  mcp_client.py  catalog.py # Global Catalog auth, JSON-RPC transport, search
+  ─────────────────────────────────  # everything above is framework-independent
+  model_factory.py                   # builds the Agno model from settings
+  agents/  base, budget, logistics,  # evaluator agents + the intake agent
+           intake
+  workflow.py                        # orchestration: search → score → debate → consensus
+  team.py                            # alternative: Agno Team coordinate mode (--team)
+  formatting.py  cli.py              # terminal render + entry point
+scripts/smoke_search.py              # manual one-shot live search (captures the fixture)
 ```
 
-The pure core never imports Agno; the framework is confined to `agents/`, `workflow.py`, and
-`model_factory.py`, so the recommendation logic stays testable and the framework is easy to swap.
+Everything above the line never imports Agno — the framework is confined to `agents/`,
+`workflow.py`, `team.py`, and `model_factory.py`. That keeps the recommendation logic testable
+without a key or network, and makes swapping frameworks cheap.
 
 ## Status
 

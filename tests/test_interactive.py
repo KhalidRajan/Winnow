@@ -119,3 +119,21 @@ def test_collect_query_llm_stops_at_max_turns():
     # falls back to extracted product after the cap; balanced default weights
     assert query.raw_text == "hat"
     assert query.weights[AgentName.BUDGET] == query.weights[AgentName.LOGISTICS]
+
+
+def test_eof_ends_the_conversation_gracefully():
+    """Ctrl-D (or piped input running out) should search, not raise EOFError."""
+
+    class EofIO(ScriptedIO):
+        def read(self, _prompt):
+            if not self.answers:
+                raise EOFError
+            return self.answers.pop(0)
+
+    io = EofIO(["a rain jacket"])
+    state = IntakeState(reply="What's your budget?", done=False, product="rain jacket")
+
+    query = collect_query_llm(
+        lambda: FakeIntakeAgent(state), read=io.read, write=io.write
+    )
+    assert query.raw_text == "rain jacket"
