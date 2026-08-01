@@ -137,3 +137,46 @@ def test_eof_ends_the_conversation_gracefully():
         lambda: FakeIntakeAgent(state), read=io.read, write=io.write
     )
     assert query.raw_text == "rain jacket"
+
+
+class RecordingAgent:
+    """Always asks another question, and records the prompts it received."""
+
+    def __init__(self, sink):
+        self.sink = sink
+
+    def run(self, prompt):
+        self.sink.append(prompt)
+        return _Output(
+            IntakeState(reply="Anything else?", done=False, product="rain jacket")
+        )
+
+
+def test_conversation_is_capped_and_never_strands_the_shopper():
+    """The agent can't keep asking forever: the last turn forces a wrap-up."""
+    prompts = []
+    io = ScriptedIO(["rain jacket", "$150", "Canada", "blue", "extra", "more"])
+
+    query = collect_query_llm(
+        lambda: RecordingAgent(prompts), read=io.read, write=io.write, max_turns=4
+    )
+
+    assert len(prompts) == 4  # capped, despite the agent always asking again
+    # the shopper is never left answering into a closed loop
+    assert len(io.answers) == 2  # only 4 of the 6 scripted lines consumed
+    assert query.raw_text == "rain jacket"
+    # the final turn instructs the agent to finish rather than ask again
+    assert "FINAL turn" in prompts[-1]
+    assert "FINAL turn" not in prompts[0]
+
+
+def test_blank_input_is_recorded_as_a_skip():
+    """Enter on a question means 'no preference', not an empty answer."""
+    prompts = []
+    io = ScriptedIO(["rain jacket", "", ""])
+
+    collect_query_llm(
+        lambda: RecordingAgent(prompts), read=io.read, write=io.write, max_turns=3
+    )
+
+    assert "skipped" in prompts[1]  # the blank turn reached the agent as a skip

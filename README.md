@@ -9,40 +9,38 @@ python -m concierge.cli -i
 ```
 
 ```
-🛍  Shopping Concierge — tell me what you're after. (Ctrl-D or 'done' to search.)
+🛍  Shopping Concierge — tell me what you're after.
+   (press Enter to skip any question)
 
 > I need a rain jacket for hiking
-Great choice! What's your budget cap, and which country should we ship to?
+Great choice! What's your budget cap, and which country should I ship to?
 > around $150, ship to Canada, men's medium
-Perfect, a men's medium hiking rain jacket up to $150 shipped to Canada. Any color
-preference, and does budget or availability matter more to you?
-> availability matters more
-Got it — availability first. Any color preference for the jacket?
-> ^D
+Perfect — a men's medium hiking rain jacket under $150, shipping to Canada.
+Any color preference, or should I just find the best options?
+>
+Got it — I'll find the best men's medium hiking rain jackets under $150 shipping to Canada.
 
 Searching…
 
-1. Cielo Rain Jacket - Women's
-   155.00 USD   final score 0.84  ████████··
-     budget    0.40 ███·····
-     logistics 0.95 ████████
-   → [budget] Over budget but low tier and 22nd percentile at $155
-     [logistics] In stock, size available, broad 11 sizes & 8 colors, ships
-   ⚖ logistics rates this 0.95 but budget only 0.40
-   https://www.cotopaxi.com/products/cielo-rain-jacket-womens?variant=40697518882877
-
-2. Highlander Stow & Go Pack Away Waterproof And Windproof Jacket
-   44.00 USD   final score 0.84  ████████··
+1. Highlander Stow & Go Pack Away Waterproof And Windproof Jacket
+   44.00 USD   final score 0.88  █████████·
      budget    1.00 ████████
-     logistics 0.80 ██████··
-   → [budget] Within budget, lowest price $44 at 0 percentile — best value
-     [logistics] In stock, size available, 7 sizes, ships; 0 colors recorded
-   https://www.preppersshop.co.uk/products/highlander-stow-go-pack-away-waterproof-jacket
+     logistics 0.75 ██████··
+   → [budget] Within budget, lowest price $44 at 0th percentile — best value
+     [logistics] In stock, requested size available, ships, 7 sizes but 0 colors reported
+
+2. Cielo Rain Jacket - Women's
+   155.00 USD   final score 0.72  ███████···
+     budget    0.50 ████····
+     logistics 0.95 ████████
+   → [budget] Over budget but low tier, $155 at 22nd percentile below median
+     [logistics] In stock, requested size available, ships; excellent 11 sizes/8 colors
+   ⚖ logistics rates this 0.95 but budget only 0.50
 ```
 
-Note the two products tie at 0.84 for opposite reasons — one is cheap, the other has the
-assortment — and the `⚖` line surfaces exactly where the agents disagreed. That reasoning trail
-is the point of the project.
+Intake is deliberately brief — at most three follow-ups, and Enter skips any of them. Note the
+`⚖` line on the second result: the agents genuinely disagreed (great availability, over budget),
+and that trade-off is surfaced rather than averaged away. The reasoning trail is the point.
 
 ## How it works
 
@@ -131,7 +129,9 @@ A one-shot query is lightly parsed for `under $NNN` (budget) and `shipping to <C
 **`-i` starts a free-form conversation** ([`interactive.py`](src/concierge/interactive.py)): an
 intake agent chats, asks follow-ups, and extracts the slots into a `Query` as you talk (its
 structured output is both the next reply and the extracted fields + a `done` flag). Answer
-naturally; it searches once it knows the product plus a budget or destination. It probes
+naturally; **press Enter to skip** any question you don't care about. Intake is capped at three
+follow-ups — the agent is told to spend them on budget and destination first, and the final turn
+forces a wrap-up so you're never answering into a closed loop. It probes
 **adaptively** — only asking about size/color/gender for products where they apply
 (apparel/footwear), not for a laptop or a coffee maker — and those become real `search_catalog`
 filters. Give it a size and the Logistics agent checks whether *that* size is actually offered

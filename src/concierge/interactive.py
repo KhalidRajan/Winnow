@@ -22,7 +22,10 @@ Writer = Callable[[str], None]
 # per-agent memory. Injectable so tests can drive the chat without a real model.
 AgentFactory = Callable[[], Any]
 
-_MAX_TURNS = 8
+# One opening message plus at most three follow-ups. Intake should feel brief;
+# the agent is told to spend its questions on budget/destination first.
+_MAX_TURNS = 4
+_SKIPPED = "(skipped — no preference)"
 
 _PRIORITY_WEIGHTS: dict[str, dict[AgentName, float]] = {
     "budget": {AgentName.BUDGET: 0.8, AgentName.LOGISTICS: 0.2},
@@ -71,33 +74,42 @@ def collect_query_llm(
     ``IntakeState`` (its next `reply` + extracted slots + a `done` flag).
     """
     write(
-        "🛍  Shopping Concierge — tell me what you're after. (Ctrl-D or 'done' to search.)\n"
+        "🛍  Shopping Concierge — tell me what you're after.\n"
+        "   (press Enter to skip any question)\n"
     )
 
     transcript: list[str] = []
     first_message = ""
     state = IntakeState()
-    for _ in range(max_turns):
+    for turn in range(max_turns):
         try:
             user_message = read("> ").strip()
         except EOFError:
-            # Ctrl-D (or piped input running out): search with what we have.
-            write("")
+            write("")  # safety net: piped input ran out / Ctrl-D
             break
         if not first_message:
             first_message = user_message
-        transcript.append(f"Shopper: {user_message}")
+        # A blank line means "skip this one" — recorded explicitly so the agent
+        # moves on instead of re-asking.
+        transcript.append(f"Shopper: {user_message or _SKIPPED}")
 
-        output = agent_factory().run(
-            "\n".join(transcript) + "\n\nReply to the shopper and extract known fields."
+        # On the final turn the agent must wrap up rather than ask again,
+        # otherwise the shopper would answer into a closed loop.
+        last_turn = turn == max_turns - 1
+        instruction = (
+            "This is the FINAL turn. Set done=true and reply with a short "
+            "confirmation of what you'll search for. Do not ask anything."
+            if last_turn
+            else "Reply to the shopper and extract known fields."
         )
+        output = agent_factory().run("\n".join(transcript) + "\n\n" + instruction)
         state = output.content
         write(state.reply)
         transcript.append(f"Concierge: {state.reply}")
-        # Guard: the model sometimes flags done while its reply still asks a
-        # question. Breaking there would discard the shopper's next answer (and
-        # strand their keystrokes in the terminal), so keep listening.
-        if state.done and not _asks_a_question(state.reply):
+
+        # Don't stop while the reply is still a question — the shopper's answer
+        # would be discarded. On the last turn we stop regardless.
+        if last_turn or (state.done and not _asks_a_question(state.reply)):
             break
 
     write("\nSearching…\n")
