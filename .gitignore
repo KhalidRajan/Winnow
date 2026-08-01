@@ -1,0 +1,24 @@
+# Secrets: ignore .env and any variant (.env.bak, .env.local, …) but keep the
+# committed template. A bare ".env" would NOT match ".env.bak.<timestamp>".
+.env
+.env.*
+!.env.example
+
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Smoke-script live dump (regenerated on each run)
+live_search_response.json
+
+# Machine-local Claude Code settings (permissions etc.)
+.claude/settings.local.json
+
+# Local planning docs (kept out of the public repo)
+project-brief.md
+IMPLEMENTATION_PLAN.md

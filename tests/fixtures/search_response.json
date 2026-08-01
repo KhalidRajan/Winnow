@@ -1,0 +1,142 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "structuredContent": {
+      "ucp": {
+        "version": "2026-04-08",
+        "status": "success"
+      },
+      "products": [
+        {
+          "id": "gid://shopify/p/6jRQHV9BCbA6lQhslgl92g",
+          "title": "Quechua Men's MH500 Hiking Lightweight Waterproof Jacket",
+          "description": {
+            "plain": "A lightweight, waterproof hiking jacket with breathable membrane."
+          },
+          "options": [
+            {"name": "Color", "values": [{"label": "Black"}, {"label": "Dark Green Gray"}]},
+            {"name": "Size", "values": [{"label": "s"}, {"label": "m"}, {"label": "l"}]}
+          ],
+          "media": [
+            {
+              "type": "image",
+              "url": "https://cdn.shopify.com/s/files/1/1330/6287/files/8612171.jpg",
+              "alt_text": "Quechua MH500"
+            }
+          ],
+          "variants": [
+            {
+              "id": "gid://shopify/ProductVariant/40369148395582",
+              "title": "Quechua Men's MH500 Hiking Lightweight Waterproof Jacket",
+              "url": "https://www.decathlon.com/products/quechua-mh500-301681?variant=40369148395582",
+              "price": {"amount": 14900, "currency": "USD"},
+              "availability": {"available": true},
+              "seller": {
+                "id": "gid://shopify/Shop/13306287",
+                "name": "Decathlon",
+                "url": "https://www.decathlon.com",
+                "domain": "decathlon-usa.myshopify.com"
+              },
+              "checkout_url": "https://www.decathlon.com/cart/40369148395582:1",
+              "rating": {"value": 5.0, "scale_min": 1, "scale_max": 5, "count": 7},
+              "condition": ["new"],
+              "eligible": {"native_checkout": false}
+            }
+          ],
+          "price_range": {
+            "min": {"amount": 14900, "currency": "USD"},
+            "max": {"amount": 14900, "currency": "USD"}
+          }
+        },
+        {
+          "id": "gid://shopify/p/5nFYvM52R4QOU8uMkR0kmj",
+          "title": "Refuge Waterproof Jacket - Eucalyptus",
+          "description": {
+            "plain": "A waterproof, windproof, and breathable jacket for active people."
+          },
+          "rating": {"value": 4.9, "scale_min": 1, "scale_max": 5, "count": 6265},
+          "options": [
+            {"name": "Color", "values": [{"label": "Black"}, {"label": "Eucalyptus"}]},
+            {"name": "Size", "values": [{"label": "XS"}, {"label": "S"}, {"label": "M"}]}
+          ],
+          "media": [
+            {
+              "type": "image",
+              "url": "https://cdn.shopify.com/s/files/1/3100/7024/files/Refuge.jpg",
+              "alt_text": "Refuge Waterproof Jacket - Eucalyptus"
+            }
+          ],
+          "variants": [
+            {
+              "id": "gid://shopify/ProductVariant/40384406093907",
+              "title": "Refuge Waterproof Jacket - Eucalyptus",
+              "url": "https://www.ambleoutdoors.com.au/products/refuge?variant=40384406093907",
+              "price": {"amount": 17500, "currency": "USD"},
+              "availability": {"available": true},
+              "seller": {
+                "id": "gid://shopify/Shop/31007024",
+                "name": "Amble Outdoors",
+                "url": "https://www.ambleoutdoors.com.au",
+                "domain": "mister-timbuktu.myshopify.com"
+              },
+              "checkout_url": "https://www.ambleoutdoors.com.au/cart/40384406093907:1",
+              "rating": {"value": 4.9, "scale_min": 1, "scale_max": 5, "count": 213},
+              "condition": ["new"],
+              "eligible": {"native_checkout": false}
+            }
+          ],
+          "price_range": {
+            "min": {"amount": 17500, "currency": "USD"},
+            "max": {"amount": 17500, "currency": "USD"}
+          }
+        },
+        {
+          "id": "gid://shopify/p/3BxA1jTVYlFtQDToj05VEh",
+          "title": "Highlander Stow & Go Pack Away Waterproof And Windproof Jacket",
+          "description": {
+            "plain": "A lightweight, waterproof, and windproof men's jacket that packs away."
+          },
+          "options": [
+            {"name": "Size", "values": [{"label": "xs"}, {"label": "s"}, {"label": "m"}]}
+          ],
+          "media": [
+            {
+              "type": "image",
+              "url": "https://cdn.shopify.com/s/files/1/0629/2412/8391/files/JAC077-BK.jpg",
+              "alt_text": "Highlander Stow & Go"
+            }
+          ],
+          "variants": [
+            {
+              "id": "gid://shopify/ProductVariant/43046218137735",
+              "title": "Highlander Stow & Go Pack Away Waterproof And Windproof Jacket",
+              "url": "https://www.preppersshop.co.uk/products/highlander?variant=43046218137735",
+              "price": {"amount": 4300, "currency": "USD"},
+              "availability": {"available": true},
+              "seller": {
+                "id": "gid://shopify/Shop/62924128391",
+                "name": " Preppers Shop UK",
+                "url": "https://www.preppersshop.co.uk",
+                "domain": "preppers-shopuk.myshopify.com"
+              },
+              "checkout_url": "https://www.preppersshop.co.uk/cart/43046218137735:1",
+              "condition": ["new"],
+              "eligible": {"native_checkout": false}
+            }
+          ],
+          "price_range": {
+            "min": {"amount": 4300, "currency": "USD"},
+            "max": {"amount": 4300, "currency": "USD"}
+          }
+        }
+      ],
+      "messages": [],
+      "pagination": {
+        "has_next_page": true,
+        "total_count": 414,
+        "cursor": "eyJvZmZzZXQiOjEwLCJ0b3RhbF9jb3VudCI6NDE0LCJyZXR1cm5lZCI6MTB9"
+      }
+    }
+  }
+}

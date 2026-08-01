@@ -1,0 +1,71 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "concierge"
+version = "0.1.0"
+description = "Multi-Agent Shopping Concierge over the Shopify Global Catalog"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2",
+    "python-dotenv>=1",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+# Orchestration + model deps are isolated here so the pure core (config, models,
+# features, consensus, auth, mcp) can be built and tested without them.
+agno = [
+    "agno==2.8.3",  # pinned: fast-moving API (Workflows/Teams/output_schema shift across releases)
+    "openai",
+    "anthropic",
+]
+dev = [
+    "pytest>=8",
+    "pytest-mock",
+    "respx",
+    "ruff",
+    "mypy",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/concierge"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The opt-in, real-model property checks are excluded from the default run.
+addopts = "-m 'not eval'"
+markers = [
+    "eval: opt-in property checks that call a real model (needs LLM_API_KEY)",
+]
+
+[tool.ruff]
+line-length = 88
+src = ["src"]
+
+[tool.ruff.lint]
+# I: import sorting/enforcement (absolute-first, sorted).
+# PLR2004: magic value used in comparison — our backstop against bare-string
+# branches like `x == "budget"`. Prefer an enum from concierge.enums instead.
+extend-select = ["I", "PLR2004"]
+
+[tool.ruff.lint.pylint]
+# Only flag magic *strings/bytes* in comparisons (numbers are fine as literals),
+# so PLR2004 nudges string constants toward enums without number noise.
+allow-magic-value-types = ["int", "float", "complex"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests legitimately compare against literal strings (fixtures, expected values).
+"tests/**" = ["PLR2004"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+mypy_path = "src"
+packages = ["concierge"]
+
+# Agno ships no type information; treat its imports as untyped rather than error.
+[[tool.mypy.overrides]]
+module = ["agno.*"]
+ignore_missing_imports = true
