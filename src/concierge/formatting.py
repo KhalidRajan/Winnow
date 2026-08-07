@@ -1,8 +1,20 @@
-"""Render a ranked shortlist for the terminal."""
+"""Render a ranked shortlist — for the terminal, or for Telegram."""
 
 from __future__ import annotations
 
+import html
+
+from concierge.enums import AgentName
 from concierge.models import Recommendation
+
+# Telegram renders a proportional font, so terminal tricks (block bars, padded
+# columns) turn into noise. Use icons and short lines instead.
+_AGENT_ICON = {
+    AgentName.BUDGET: "💰",
+    AgentName.LOGISTICS: "📦",
+    AgentName.QUALITY: "⭐",
+    AgentName.SUSTAINABILITY: "🌱",
+}
 
 
 def _price(rec: Recommendation) -> str:
@@ -41,3 +53,50 @@ def render(recommendations: list[Recommendation]) -> str:
             lines.append(f"   {product.url}")
         lines.append("")
     return "\n".join(lines).rstrip()
+
+
+def _reasons_by_agent(rec: Recommendation) -> list[tuple[AgentName, str]]:
+    return [
+        (score.agent, "; ".join(score.reasons))
+        for score in rec.per_agent
+        if score.reasons
+    ]
+
+
+def render_telegram(recommendations: list[Recommendation]) -> str:
+    """Render for Telegram (``parse_mode=HTML``).
+
+    The title becomes a tappable link instead of a wrapped raw URL, scores go on
+    one compact line, and each agent's reasoning gets an icon — all of which read
+    far better in a chat bubble than the terminal's aligned columns.
+    """
+    if not recommendations:
+        return "No products matched your search."
+
+    blocks: list[str] = []
+    for rank, rec in enumerate(recommendations, start=1):
+        product = rec.product
+        title = html.escape(product.title)
+        heading = (
+            f'<a href="{html.escape(product.url, quote=True)}">{title}</a>'
+            if product.url
+            else title
+        )
+        lines = [
+            f"<b>{rank}. {heading}</b>",
+            f"{_price(rec)} · score {rec.final_score:.2f}",
+        ]
+
+        scores = " · ".join(
+            f"{_AGENT_ICON.get(s.agent, '•')} {s.agent.value} {s.score:.2f}"
+            for s in rec.per_agent
+        )
+        if scores:
+            lines.append(scores)
+        for agent, reason in _reasons_by_agent(rec):
+            lines.append(f"{_AGENT_ICON.get(agent, '•')} {html.escape(reason)}")
+        for tradeoff in rec.tradeoffs:
+            lines.append(f"⚖️ <i>{html.escape(tradeoff)}</i>")
+        blocks.append("\n".join(lines))
+
+    return "\n\n".join(blocks)

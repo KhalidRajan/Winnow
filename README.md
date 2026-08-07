@@ -2,7 +2,8 @@
 
 Winnows thousands of Shopify products down to the handful worth buying. Chat about what you
 want, and specialized agents search the **Shopify Global Catalog** across all Shopify merchants,
-debate the trade-offs, and return a ranked shortlist with reasons.
+debate the trade-offs, and return a ranked shortlist with reasons — in the terminal, or over
+[Telegram](#telegram) from your phone.
 
 ```bash
 python -m concierge.cli -i
@@ -122,6 +123,9 @@ python -m concierge.cli 'waterproof jacket under $200' --debate 2
 
 # Use an Agno Team (coordinate mode) to synthesize the ranking instead of consensus
 python -m concierge.cli 'waterproof jacket under $200' --team
+
+# Serve the same concierge over Telegram — chat to it from your phone
+python -m concierge.cli --telegram
 ```
 
 A one-shot query is lightly parsed for `under $NNN` (budget) and `shipping to <Country>` (region).
@@ -149,6 +153,44 @@ reasoning. Each agent revises *from its own domain* — it may hold or move, but
 another agent's priorities — and the loop stops early on convergence. The final weighted
 consensus then runs on the debated scores. The loop itself ([`debate.py`](src/concierge/debate.py))
 is pure and framework-independent; the revision is an LLM call in the agents layer.
+
+### Telegram
+
+`--telegram` serves the same conversation over a Telegram bot
+([`telegram.py`](src/concierge/telegram.py)) — the intake loop's `read`/`write` are simply bound
+to a chat instead of the terminal, so agents, scoring, and rendering are untouched.
+
+It uses **long-polling, not webhooks**: the process only makes outbound calls to the Bot API, so
+it runs on a laptop behind NAT with no deployment, tunnel, or open port. Setup:
+
+1. Create a bot with [@BotFather](https://t.me/BotFather) → copy the token.
+2. Message your bot once, then read `message.chat.id` from
+   `https://api.telegram.org/bot<TOKEN>/getUpdates`.
+3. Put both in `.env`:
+   ```
+   TELEGRAM_BOT_TOKEN=...
+   TELEGRAM_ALLOWED_CHAT_IDS=123456789
+   ```
+
+**The allowlist is required, not optional.** Telegram has no "private bot" setting — anyone who
+knows the @username can message it, and every message would spend your model credits and catalog
+rate limit. Chats outside `TELEGRAM_ALLOWED_CHAT_IDS` are ignored *silently* (a reply would
+confirm the bot is live to whoever is probing), and starting without an allowlist fails loud
+rather than quietly serving everyone. Messages queued while the bot was offline are dropped on
+startup, so it doesn't wake up answering yesterday's questions.
+
+Results get their own renderer: the terminal's score bars and padded columns assume a monospace
+font, so Telegram instead gets HTML with the product title as a tappable link, one icon-prefixed
+line per agent, and link previews suppressed.
+
+```
+1. Oud 3-Wick Candle              ← tappable link to the product
+25.50 USD · score 0.82
+💰 budget 1.00 · 📦 logistics 0.65
+💰 Lowest price ($25.50), 0th percentile, within budget — best value
+📦 In stock and ships to requested region; no size/color variants listed
+⚖️ budget rates this 1.00 but logistics only 0.65
+```
 
 ### Two orchestrations (default vs. Agno Team)
 
@@ -192,13 +234,15 @@ src/concierge/
   debate.py                          # debate loop over per-agent "reviser" callables (pure)
   interactive.py                     # conversational intake loop (agent injected)
   auth.py  mcp_client.py  catalog.py # Global Catalog auth, JSON-RPC transport, search
+  telegram.py                        # Bot API long-polling + allowlisted chat sessions
+  formatting.py                      # renderers: terminal (bars) and Telegram (HTML)
   ─────────────────────────────────  # everything above is framework-independent
   model_factory.py                   # builds the Agno model from settings
   agents/  base, budget, logistics,  # evaluator agents + the intake agent
            intake
   workflow.py                        # orchestration: search → score → debate → consensus
   team.py                            # alternative: Agno Team coordinate mode (--team)
-  formatting.py  cli.py              # terminal render + entry point
+  cli.py                             # entry point (terminal + --telegram)
 scripts/smoke_search.py              # manual one-shot live search (captures the fixture)
 ```
 
@@ -210,7 +254,7 @@ without a key or network, and makes swapping frameworks cheap.
 
 Complete and running live end-to-end against the real Global Catalog: config, domain models,
 deterministic features, weighted consensus, auth, MCP client, the Agno evaluator agents, the
-debate loop, conversational intake, and the CLI.
+debate loop, conversational intake, the CLI, and a Telegram front-end.
 
 A few design decisions worth calling out, since they were driven by what the live API actually
 returns rather than by the original spec:

@@ -6,8 +6,9 @@ import argparse
 import logging
 import re
 import sys
+from typing import Any
 
-from concierge import formatting, interactive, workflow
+from concierge import formatting, interactive, telegram, workflow
 from concierge.agents.intake import build_intake_agent
 from concierge.auth import TokenProvider
 from concierge.config import ConfigError, Settings
@@ -67,7 +68,43 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="use an Agno Team to coordinate + synthesize instead of deterministic consensus",
     )
+    parser.add_argument(
+        "--telegram",
+        action="store_true",
+        help="serve the concierge over Telegram (long-polling, allowlisted chats)",
+    )
     return parser
+
+
+def run_telegram(
+    settings: Settings, client: McpClient, model: object, args: Any
+) -> int:
+    """Serve the same pipeline over a Telegram chat (long-polling, allowlisted)."""
+    # Validate before announcing anything, so a misconfigured bot never prints
+    # "running" and then dies.
+    _, allowed = telegram.require_telegram_settings(settings)
+
+    def handle(session: telegram.ChatSession) -> None:
+        query = interactive.collect_query_llm(
+            lambda: build_intake_agent(model), read=session.read, write=session.write
+        )
+        recommendations = workflow.run(
+            query,
+            client,
+            model=model,
+            use_llm=True,
+            use_team=args.team,
+            top_n=args.top,
+            debate_rounds=args.debate,
+        )
+        session.write_html(formatting.render_telegram(recommendations))
+
+    print(
+        f"Telegram bot running for chat(s) {', '.join(sorted(allowed))} "
+        "— Ctrl-C to stop. Message your bot to start."
+    )
+    telegram.run_bot(settings, handle)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -86,6 +123,16 @@ def main(argv: list[str] | None = None) -> int:
 
     client = McpClient(settings, TokenProvider(settings))
     model = None if args.no_llm else build_model(settings)
+
+    if args.telegram:
+        if model is None:
+            print("The Telegram bot needs a model — drop --no-llm.", file=sys.stderr)
+            return 1
+        try:
+            return run_telegram(settings, client, model, args)
+        except ConfigError as exc:
+            print(f"Configuration error: {exc}", file=sys.stderr)
+            return 1
 
     if args.interactive:
         if model is None:
