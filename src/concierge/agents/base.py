@@ -94,9 +94,12 @@ def build_revision_prompt(
             f"{p.agent.value} scored {p.score:.2f} ({'; '.join(p.reasons)})"
             for p in peers_by_upid.get(upid, [])
         )
+        rendered_features = json.dumps(
+            feature.model_dump(mode="json") if feature else {}
+        )
         blocks.append(
             f"- {titles.get(upid, upid)}\n"
-            f"  features: {json.dumps(feature.model_dump(mode='json') if feature else {})}\n"
+            f"  features: {rendered_features}\n"
             f"  your current score: {own.score:.2f} ({'; '.join(own.reasons)})\n"
             f"  other evaluators: {peers or 'none'}"
         )

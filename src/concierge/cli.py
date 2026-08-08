@@ -66,7 +66,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--team",
         action="store_true",
-        help="use an Agno Team to coordinate + synthesize instead of deterministic consensus",
+        help=(
+            "use an Agno Team to coordinate + synthesize "
+            "instead of deterministic consensus"
+        ),
     )
     parser.add_argument(
         "--telegram",

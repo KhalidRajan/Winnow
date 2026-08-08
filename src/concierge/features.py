@@ -8,6 +8,7 @@ from __future__ import annotations
 import re
 from statistics import fmean, median
 
+from concierge.constants import BAYES_PRIOR_WEIGHT
 from concierge.enums import Availability, PriceTier
 from concierge.models import (
     BudgetFeatures,
@@ -16,10 +17,6 @@ from concierge.models import (
     QualityFeatures,
     Query,
 )
-
-# Prior weight for the Bayesian rating shrinkage. Larger -> ratings with few
-# reviews are pulled harder toward the set mean.
-_BAYES_PRIOR_WEIGHT = 20.0
 
 
 def _percentile(value: float | None, population: list[float | None]) -> float | None:
@@ -94,8 +91,8 @@ def quality_features(products: list[Product], query: Query) -> list[QualityFeatu
         bayesian: float | None
         if rating is not None and set_mean is not None:
             v = float(product.review_count or 0)
-            bayesian = (v / (v + _BAYES_PRIOR_WEIGHT)) * rating + (
-                _BAYES_PRIOR_WEIGHT / (v + _BAYES_PRIOR_WEIGHT)
+            bayesian = (v / (v + BAYES_PRIOR_WEIGHT)) * rating + (
+                BAYES_PRIOR_WEIGHT / (v + BAYES_PRIOR_WEIGHT)
             ) * set_mean
         else:
             # No rating -> fall fully back to the prior (set mean), which is

@@ -49,7 +49,8 @@ def main() -> int:
     except AuthError as exc:
         print(f"AUTH FAILED: {exc}")
         print(
-            "Seam to try: switch auth.py `data=` -> `json=` if the body format is wrong."
+            "Seam to try: switch auth.py `data=` -> `json=` "
+            "if the body format is wrong."
         )
         return 1
 

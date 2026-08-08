@@ -17,11 +17,13 @@ from __future__ import annotations
 import time
 from collections import deque
 from collections.abc import Callable
+from http import HTTPStatus
 from typing import Any
 
 import httpx
 
 from concierge.config import ConfigError, Settings
+from concierge.constants import CONVERSATION_TIMEOUT
 
 _API = "https://api.telegram.org"
 # Telegram hard-caps a message at 4096 characters; leave room for the chunk
@@ -29,13 +31,9 @@ _API = "https://api.telegram.org"
 _MAX_MESSAGE = 3900
 # Seconds Telegram holds a long-poll open before returning empty.
 _POLL_TIMEOUT = 50
-# Give up on a silent conversation after this long (raises EOFError, which the
-# intake loop already treats as "search with what we have").
-_CONVERSATION_TIMEOUT = 600.0
 # You can't send an empty Telegram message, so the blank line that means "skip
 # this question" in the terminal needs a word instead.
 SKIP_TOKEN = "skip"
-_TOO_MANY_REQUESTS = 429
 # Telegram asks us to back off via `parameters.retry_after`; obey it a few times
 # before treating the throttling as fatal.
 _MAX_RATE_LIMIT_RETRIES = 3
@@ -129,12 +127,12 @@ class TelegramClient:
             except httpx.HTTPError as exc:
                 raise TelegramError(f"{method} failed: {exc}") from exc
             if (
-                response.status_code == _TOO_MANY_REQUESTS
+                response.status_code == HTTPStatus.TOO_MANY_REQUESTS
                 and attempt < _MAX_RATE_LIMIT_RETRIES
             ):
                 self._sleep(_retry_after(response))
                 continue
-            if response.status_code != 200:
+            if response.status_code != HTTPStatus.OK:
                 raise TelegramError(
                     f"{method} returned {response.status_code}: {response.text}"
                 )
@@ -199,7 +197,7 @@ class ChatSession:
         first_message: str,
         inbox: _Inbox,
         allowed: frozenset[str],
-        timeout: float = _CONVERSATION_TIMEOUT,
+        timeout: float = CONVERSATION_TIMEOUT,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._client = client

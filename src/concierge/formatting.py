@@ -39,7 +39,8 @@ def render(recommendations: list[Recommendation]) -> str:
         product = rec.product
         lines.append(f"{rank}. {product.title}")
         lines.append(
-            f"   {_price(rec)}   final score {rec.final_score:.2f}  {_bar(rec.final_score)}"
+            f"   {_price(rec)}   final score {rec.final_score:.2f}  "
+            f"{_bar(rec.final_score)}"
         )
         for score in rec.per_agent:
             lines.append(

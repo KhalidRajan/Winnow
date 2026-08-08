@@ -12,18 +12,19 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from concierge.constants import (
+    DEBATE_CONVERGENCE_EPSILON,
+    DEBATE_SPREAD_THRESHOLD,
+)
 from concierge.enums import AgentName
 from concierge.models import AgentScore
 
 # (own_scores, all_scores, contested_upids) -> the agent's full revised scores.
 Reviser = Callable[[list[AgentScore], list[AgentScore], set[str]], list[AgentScore]]
 
-_SPREAD_THRESHOLD = 0.3
-_CONVERGENCE_EPSILON = 0.05
-
 
 def contested_upids(
-    scores: list[AgentScore], threshold: float = _SPREAD_THRESHOLD
+    scores: list[AgentScore], threshold: float = DEBATE_SPREAD_THRESHOLD
 ) -> set[str]:
     """UPIDs where the agents disagree by at least ``threshold``."""
     by_upid: dict[str, list[float]] = {}
@@ -41,8 +42,8 @@ def run_debate(
     revisers: dict[AgentName, Reviser],
     rounds: int,
     *,
-    spread_threshold: float = _SPREAD_THRESHOLD,
-    epsilon: float = _CONVERGENCE_EPSILON,
+    spread_threshold: float = DEBATE_SPREAD_THRESHOLD,
+    epsilon: float = DEBATE_CONVERGENCE_EPSILON,
 ) -> list[AgentScore]:
     """Run up to ``rounds`` revision rounds, stopping on convergence."""
     for _ in range(rounds):

@@ -48,7 +48,10 @@ src = ["src"]
 # I: import sorting/enforcement (absolute-first, sorted).
 # PLR2004: magic value used in comparison — our backstop against bare-string
 # branches like `x == "budget"`. Prefer an enum from concierge.enums instead.
-extend-select = ["I", "PLR2004"]
+# E501: line length. `ruff format` already wraps code to 88, but it will not
+# split string literals — without this rule long strings drift past the limit
+# unnoticed, which is exactly how the only four violations got in.
+extend-select = ["I", "PLR2004", "E501"]
 
 [tool.ruff.lint.pylint]
 # Only flag magic *strings/bytes* in comparisons (numbers are fine as literals),

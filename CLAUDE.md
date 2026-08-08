@@ -55,7 +55,7 @@ Agno agents for deterministic scoring so the whole pipeline runs without a model
 ## Conventions (important)
 
 - **Keep the pure core framework-independent.** `config`, `models`, `features`, `consensus`,
-  `auth`, `mcp_client`, `catalog` must NOT import Agno. Agno is confined to `agents/`,
+  `auth`, `mcp_client`, `catalog`, `constants` must NOT import Agno. Agno is confined to `agents/`,
   `workflow.py`, and `model_factory.py`. This keeps the recommendation logic testable without a
   key/network and makes framework swaps cheap.
 - **LLM = OpenRouter by default** (`llm_provider="openrouter"`, key in `LLM_API_KEY`). Switch
@@ -83,6 +83,12 @@ See the local `IMPLEMENTATION_PLAN.md` (gitignored) for phase history and open i
 - **Formatting:** Formatted with `ruff format` (88-char line limit).
 - **Type Checking:** Strict `mypy` typing required on all public signatures.
 - **Imports:** Absolute imports only (`from my_package.module import ...`).
+- **Tuning knobs live in `constants.py`.** Thresholds, limits, and timeouts a person might want
+  to adjust (Bayesian prior weight, debate spread/epsilon, intake turns, search limit, token
+  margins) belong there, named for their domain. Facts dictated by an external protocol —
+  Telegram's 4096-char cap, the retryable HTTP status set, backoff schedules — stay in the module
+  that honours them, next to the comment explaining why. `constants.py` imports nothing from the
+  package, so it can never introduce a cycle.
 - **No magic strings — use enums.** Domain vocabulary (agent names, price tiers, providers,
   and any future closed set of string constants) lives in `concierge/enums.py` as `StrEnum`s.
   Never scatter bare literals like `"budget"` or `"low"` through the code — a typo becomes a
