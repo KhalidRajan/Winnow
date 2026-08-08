@@ -86,7 +86,10 @@ def run_telegram(
 
     def handle(session: telegram.ChatSession) -> None:
         query = interactive.collect_query_llm(
-            lambda: build_intake_agent(model), read=session.read, write=session.write
+            lambda: build_intake_agent(model),
+            read=session.read,
+            write=session.write,
+            skip_hint=f'(send "{telegram.SKIP_TOKEN}" to skip any question)',
         )
         recommendations = workflow.run(
             query,

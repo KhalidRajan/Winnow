@@ -14,6 +14,9 @@ session just supplies Telegram-flavoured versions; nothing else changes.
 
 from __future__ import annotations
 
+import time
+from collections import deque
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -29,6 +32,19 @@ _POLL_TIMEOUT = 50
 # Give up on a silent conversation after this long (raises EOFError, which the
 # intake loop already treats as "search with what we have").
 _CONVERSATION_TIMEOUT = 600.0
+# You can't send an empty Telegram message, so the blank line that means "skip
+# this question" in the terminal needs a word instead.
+SKIP_TOKEN = "skip"
+_TOO_MANY_REQUESTS = 429
+# Telegram asks us to back off via `parameters.retry_after`; obey it a few times
+# before treating the throttling as fatal.
+_MAX_RATE_LIMIT_RETRIES = 3
+_DEFAULT_RETRY_AFTER = 1.0
+# A bot that lives for days must ride out transient network failures instead of
+# exiting on the first one — but still give up if the transport is truly gone.
+_MAX_CONSECUTIVE_POLL_FAILURES = 5
+_BACKOFF_BASE = 2.0
+_BACKOFF_CAP = 60.0
 
 
 class TelegramError(Exception):
@@ -76,6 +92,19 @@ def chunk(text: str, limit: int = _MAX_MESSAGE) -> list[str]:
     return [c for c in chunks if c.strip()]
 
 
+def _retry_after(response: httpx.Response) -> float:
+    """Seconds Telegram wants us to wait, from a 429 body's ``retry_after``."""
+    try:
+        body = response.json()
+    except ValueError:
+        return _DEFAULT_RETRY_AFTER
+    value: Any = (body.get("parameters") or {}).get("retry_after")
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return _DEFAULT_RETRY_AFTER
+
+
 class TelegramClient:
     """Minimal Bot API client — just the two calls we need."""
 
@@ -84,24 +113,38 @@ class TelegramClient:
         token: str,
         http_client: httpx.Client | None = None,
         poll_timeout: int = _POLL_TIMEOUT,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._base = f"{_API}/bot{token}"
         self._poll_timeout = poll_timeout
         self._client = http_client or httpx.Client(timeout=poll_timeout + 15)
+        self._sleep = sleep
 
     def _call(self, method: str, payload: dict[str, Any]) -> Any:
-        try:
-            response = self._client.post(f"{self._base}/{method}", json=payload)
-        except httpx.HTTPError as exc:
-            raise TelegramError(f"{method} failed: {exc}") from exc
-        if response.status_code != 200:
-            raise TelegramError(
-                f"{method} returned {response.status_code}: {response.text}"
-            )
-        body = response.json()
-        if not body.get("ok"):
-            raise TelegramError(f"{method} error: {body}")
-        return body.get("result")
+        # Rate limiting is routine (Telegram throttles bursts of sendMessage
+        # chunks), so honour retry_after rather than surfacing it as an error.
+        for attempt in range(_MAX_RATE_LIMIT_RETRIES + 1):
+            try:
+                response = self._client.post(f"{self._base}/{method}", json=payload)
+            except httpx.HTTPError as exc:
+                raise TelegramError(f"{method} failed: {exc}") from exc
+            if (
+                response.status_code == _TOO_MANY_REQUESTS
+                and attempt < _MAX_RATE_LIMIT_RETRIES
+            ):
+                self._sleep(_retry_after(response))
+                continue
+            if response.status_code != 200:
+                raise TelegramError(
+                    f"{method} returned {response.status_code}: {response.text}"
+                )
+            body = response.json()
+            if not body.get("ok"):
+                raise TelegramError(f"{method} error: {body}")
+            return body.get("result")
+        raise TelegramError(
+            f"{method} still rate-limited after {_MAX_RATE_LIMIT_RETRIES} retries"
+        )
 
     def get_updates(self, offset: int | None) -> list[dict[str, Any]]:
         payload: dict[str, Any] = {"timeout": self._poll_timeout}
@@ -131,6 +174,11 @@ class TelegramClient:
         self._client.close()
 
 
+def _unskip(text: str) -> str:
+    """Map the "skip" keyword onto the blank line the intake loop treats as a skip."""
+    return "" if text.strip().lower() == SKIP_TOKEN else text
+
+
 def _message_of(update: dict[str, Any]) -> tuple[str, str] | None:
     """Extract (chat_id, text) from an update, or None if it isn't a text message."""
     message = update.get("message") or update.get("edited_message") or {}
@@ -149,31 +197,31 @@ class ChatSession:
         client: TelegramClient,
         chat_id: str,
         first_message: str,
-        offset_holder: _Offset,
+        inbox: _Inbox,
         allowed: frozenset[str],
         timeout: float = _CONVERSATION_TIMEOUT,
-        clock: Any = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._client = client
         self._chat_id = chat_id
         self._pending = [first_message]
-        self._offset = offset_holder
+        self._inbox = inbox
         self._allowed = allowed
         self._timeout = timeout
-        import time
-
-        self._clock = clock or time.monotonic
+        self._clock = clock
 
     def read(self, _prompt: str = "") -> str:
         """Return the shopper's next message (the CLI's "> " prompt is dropped)."""
         if self._pending:
-            return self._pending.pop(0)
+            return _unskip(self._pending.pop(0))
 
         deadline = self._clock() + self._timeout
         while self._clock() < deadline:
-            for chat_id, text in self._offset.poll(self._client, self._allowed):
-                if chat_id == self._chat_id:
-                    return text
+            queued = self._inbox.next_message(
+                self._client, self._allowed, chat_id=self._chat_id
+            )
+            if queued is not None:
+                return _unskip(queued[1])
         # Treated by the intake loop as "search with what we have".
         raise EOFError("no reply from the shopper")
 
@@ -186,26 +234,61 @@ class ChatSession:
         self.write(text, parse_mode="HTML")
 
 
-class _Offset:
-    """Tracks the getUpdates offset and filters updates through the allowlist."""
+class _Inbox:
+    """Tracks the getUpdates offset and queues what the caller didn't ask for.
 
-    def __init__(self, value: int | None = None) -> None:
-        self.value = value
+    ``getUpdates`` drains messages for *every* allowed chat at once and advances
+    the offset irreversibly, so a poller that keeps only the messages it wanted
+    silently destroys the rest. Both the outer loop and :meth:`ChatSession.read`
+    therefore draw from this one queue: a batch of "hi" + "waterproof jacket"
+    reaches the same conversation in order, and a second allowed chat's messages
+    wait their turn instead of vanishing.
+    """
 
-    def poll(
-        self, client: TelegramClient, allowed: frozenset[str]
-    ) -> list[tuple[str, str]]:
-        messages: list[tuple[str, str]] = []
-        for update in client.get_updates(self.value):
-            self.value = update["update_id"] + 1
+    def __init__(self, offset: int | None = None) -> None:
+        self.offset = offset
+        self._queue: deque[tuple[str, str]] = deque()
+
+    def _fill(self, client: TelegramClient, allowed: frozenset[str]) -> None:
+        for update in client.get_updates(self.offset):
+            self.offset = update["update_id"] + 1
             parsed = _message_of(update)
             if parsed is None:
                 continue
             chat_id, text = parsed
             if chat_id not in allowed:
                 continue  # silently ignore strangers — never confirm we're here
-            messages.append((chat_id, text))
-        return messages
+            self._queue.append((chat_id, text))
+
+    def _take(self, chat_id: str | None) -> tuple[str, str] | None:
+        if chat_id is None:
+            return self._queue.popleft() if self._queue else None
+        for index, entry in enumerate(self._queue):
+            if entry[0] == chat_id:
+                del self._queue[index]
+                return entry
+        return None
+
+    def next_message(
+        self,
+        client: TelegramClient,
+        allowed: frozenset[str],
+        chat_id: str | None = None,
+    ) -> tuple[str, str] | None:
+        """Next queued message — for ``chat_id``, or any chat — polling if empty."""
+        queued = self._take(chat_id)
+        if queued is not None:
+            return queued
+        self._fill(client, allowed)
+        return self._take(chat_id)
+
+
+def _apologise(session: ChatSession, exc: Exception) -> None:
+    """Tell the shopper we failed — but never let *that* failure kill the bot."""
+    try:
+        session.write(f"Sorry — something went wrong: {exc}")
+    except (TelegramError, httpx.HTTPError):
+        pass  # can't even apologise; the next poll decides whether we're done
 
 
 def run_bot(
@@ -214,28 +297,44 @@ def run_bot(
     client: TelegramClient | None = None,
     drop_pending: bool = True,
     max_conversations: int | None = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> None:
     """Long-poll for messages and run ``handle(session)`` per conversation.
 
     ``handle`` receives a :class:`ChatSession` and drives the normal pipeline
     with its ``read``/``write``. ``max_conversations`` bounds the loop (tests).
+
+    A transient network blip must not end a bot that's meant to run for days, so
+    polling failures are retried with exponential backoff and only become fatal
+    after ``_MAX_CONSECUTIVE_POLL_FAILURES`` in a row.
     """
     token, allowed = require_telegram_settings(settings)
     client = client or TelegramClient(token)
-    offset = _Offset(client.drop_pending() if drop_pending else None)
+    inbox = _Inbox(client.drop_pending() if drop_pending else None)
 
     handled = 0
+    failures = 0
     while max_conversations is None or handled < max_conversations:
-        for chat_id, text in offset.poll(client, allowed):
-            session = ChatSession(client, chat_id, text, offset, allowed)
-            try:
-                handle(session)
-            except EOFError:
-                pass  # shopper went quiet; wait for the next conversation
-            except (TelegramError, httpx.HTTPError):
-                raise  # transport is broken — don't spin
-            except Exception as exc:  # noqa: BLE001 - one bad chat must not kill the bot
-                session.write(f"Sorry — something went wrong: {exc}")
-            handled += 1
-            if max_conversations is not None and handled >= max_conversations:
-                break
+        try:
+            queued = inbox.next_message(client, allowed)
+        except (TelegramError, httpx.HTTPError) as exc:
+            failures += 1
+            if failures >= _MAX_CONSECUTIVE_POLL_FAILURES:
+                raise TelegramError(
+                    f"giving up after {failures} consecutive polling failures: {exc}"
+                ) from exc
+            sleep(min(_BACKOFF_BASE**failures, _BACKOFF_CAP))
+            continue
+        failures = 0
+        if queued is None:
+            continue  # long-poll came back empty; go round again
+
+        chat_id, text = queued
+        session = ChatSession(client, chat_id, text, inbox, allowed)
+        try:
+            handle(session)
+        except EOFError:
+            pass  # shopper went quiet; wait for the next conversation
+        except Exception as exc:  # noqa: BLE001 - one bad chat must not kill the bot
+            _apologise(session, exc)
+        handled += 1

@@ -67,15 +67,19 @@ def collect_query_llm(
     read: Reader = input,
     write: Writer = print,
     max_turns: int = _MAX_TURNS,
+    skip_hint: str = "(press Enter to skip any question)",
 ) -> Query:
     """Free-form conversational intake: chat until the concierge has enough.
 
     A fresh agent per turn reasons over the whole transcript and returns an
     ``IntakeState`` (its next `reply` + extracted slots + a `done` flag).
+
+    ``skip_hint`` is caller-supplied because how you skip a question depends on
+    the front-end: a terminal takes a blank line, Telegram can't send one.
     """
     write(
         "🛍  Shopping Concierge — tell me what you're after.\n"
-        "   (press Enter to skip any question)\n"
+        + (f"   {skip_hint}\n" if skip_hint else "")
     )
 
     transcript: list[str] = []

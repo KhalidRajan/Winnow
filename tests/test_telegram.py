@@ -3,7 +3,8 @@ import pytest
 from concierge.config import ConfigError, Settings
 from concierge.telegram import (
     ChatSession,
-    _Offset,
+    TelegramError,
+    _Inbox,
     chunk,
     require_telegram_settings,
     run_bot,
@@ -77,23 +78,37 @@ def test_require_settings_returns_token_and_allowlist():
 
 def test_stranger_messages_are_ignored_silently():
     client = FakeClient([[_update(1, STRANGER, "hello?"), _update(2, ALLOWED, "hi")]])
-    messages = _Offset().poll(client, frozenset({ALLOWED}))
+    inbox = _Inbox()
+    allowed = frozenset({ALLOWED})
 
-    assert messages == [(ALLOWED, "hi")]  # stranger dropped
+    assert inbox.next_message(client, allowed) == (ALLOWED, "hi")  # stranger dropped
+    assert inbox.next_message(client, allowed) is None  # nothing else queued
     assert client.sent == []  # and never replied to
 
 
 def test_offset_advances_past_every_update():
     client = FakeClient([[_update(7, STRANGER, "x"), _update(8, ALLOWED, "y")]])
-    offset = _Offset()
-    offset.poll(client, frozenset({ALLOWED}))
+    inbox = _Inbox()
+    inbox.next_message(client, frozenset({ALLOWED}))
     # advances past the stranger too, so it isn't re-fetched forever
-    assert offset.value == 9
+    assert inbox.offset == 9
 
 
 def test_non_text_updates_are_skipped():
     client = FakeClient([[{"update_id": 1, "message": {"chat": {"id": ALLOWED}}}]])
-    assert _Offset().poll(client, frozenset({ALLOWED})) == []
+    assert _Inbox().next_message(client, frozenset({ALLOWED})) is None
+
+
+def test_inbox_keeps_messages_it_was_not_asked_for():
+    """A poll for one chat must not destroy another chat's messages."""
+    client = FakeClient([[_update(1, STRANGER, "mine"), _update(2, ALLOWED, "yours")]])
+    inbox = _Inbox()
+    allowed = frozenset({ALLOWED, STRANGER})
+
+    # ask for ALLOWED first — STRANGER's message arrived in the same batch
+    assert inbox.next_message(client, allowed, chat_id=ALLOWED) == (ALLOWED, "yours")
+    # ...and is still there afterwards, without another poll
+    assert inbox.next_message(client, allowed, chat_id=STRANGER) == (STRANGER, "mine")
 
 
 # --- chunking ---
@@ -121,7 +136,7 @@ def test_single_overlong_line_is_hard_split():
 
 def test_session_replays_first_message_then_polls():
     client = FakeClient([[_update(2, ALLOWED, "second")]])
-    session = ChatSession(client, ALLOWED, "first", _Offset(), frozenset({ALLOWED}))
+    session = ChatSession(client, ALLOWED, "first", _Inbox(), frozenset({ALLOWED}))
 
     assert session.read() == "first"  # the message that opened the chat
     assert session.read() == "second"  # then long-polls
@@ -129,7 +144,7 @@ def test_session_replays_first_message_then_polls():
 
 def test_session_write_sends_and_skips_blanks():
     client = FakeClient()
-    session = ChatSession(client, ALLOWED, "hi", _Offset(), frozenset({ALLOWED}))
+    session = ChatSession(client, ALLOWED, "hi", _Inbox(), frozenset({ALLOWED}))
 
     session.write("hello")
     session.write("   ")  # the intake loop writes blanks on EOF
@@ -143,7 +158,7 @@ def test_session_read_times_out_as_eof():
         FakeClient(),
         ALLOWED,
         "hi",
-        _Offset(),
+        _Inbox(),
         frozenset({ALLOWED}),
         timeout=10.0,
         clock=lambda: next(ticks),
@@ -182,10 +197,115 @@ def test_run_bot_survives_a_failing_conversation():
     assert client.sent and "went wrong" in client.sent[0][1]
 
 
+def test_a_burst_of_messages_reaches_one_conversation():
+    """ "hi" then "waterproof jacket" in one batch must not become two chats."""
+    client = FakeClient(
+        [[_update(1, ALLOWED, "hi"), _update(2, ALLOWED, "waterproof jacket")]]
+    )
+    seen = []
+
+    def handle(session):
+        seen.append(session.read())
+        seen.append(session.read())  # the rest of the burst, not a fresh poll
+
+    run_bot(_settings(), handle, client=client, drop_pending=False, max_conversations=1)
+
+    assert seen == ["hi", "waterproof jacket"]
+
+
+def test_a_read_leaves_another_chats_message_queued():
+    """A poll inside one conversation used to silently discard other chats."""
+    allowed = frozenset({ALLOWED, STRANGER})
+    inbox = _Inbox()
+    client = FakeClient([[_update(2, STRANGER, "me too")]])
+    ticks = iter([0.0, 0.0, 999.0])
+    session = ChatSession(
+        client,
+        ALLOWED,
+        "hi",
+        inbox,
+        allowed,
+        timeout=10.0,
+        clock=lambda: next(ticks),
+    )
+
+    assert session.read() == "hi"
+    with pytest.raises(EOFError):
+        session.read()  # polls, finds only STRANGER's message, gives up waiting
+
+    # ...and STRANGER's message survived that poll, ready for the next conversation
+    assert inbox.next_message(client, allowed) == (STRANGER, "me too")
+
+
+def test_a_transient_poll_failure_is_retried_not_fatal():
+    class FlakyClient(FakeClient):
+        def __init__(self):
+            super().__init__([[_update(1, ALLOWED, "hi")]])
+            self.attempts = 0
+
+        def get_updates(self, offset):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise TelegramError("connection reset")
+            return super().get_updates(offset)
+
+    client = FlakyClient()
+    seen = []
+    run_bot(
+        _settings(),
+        lambda s: seen.append(s.read()),
+        client=client,
+        drop_pending=False,
+        max_conversations=1,
+        sleep=lambda _seconds: None,
+    )
+
+    assert seen == ["hi"]  # rode out the blip
+
+
+def test_a_dead_transport_eventually_gives_up():
+    class DeadClient(FakeClient):
+        def get_updates(self, offset):
+            raise TelegramError("network unreachable")
+
+    with pytest.raises(TelegramError, match="consecutive polling failures"):
+        run_bot(
+            _settings(),
+            lambda s: None,
+            client=DeadClient(),
+            drop_pending=False,
+            sleep=lambda _seconds: None,
+        )
+
+
+def test_a_failing_apology_does_not_kill_the_bot():
+    """If the error reply itself fails to send, keep serving."""
+
+    class UnsendableClient(FakeClient):
+        def send_message(self, chat_id, text, parse_mode=None):
+            raise TelegramError("sendMessage returned 403")
+
+    client = UnsendableClient([[_update(1, ALLOWED, "boom")]])
+
+    def handle(session):
+        raise ValueError("scoring blew up")
+
+    # must return normally rather than propagating the TelegramError
+    run_bot(_settings(), handle, client=client, drop_pending=False, max_conversations=1)
+
+
+def test_skip_token_reads_as_the_blank_line_intake_expects():
+    client = FakeClient([[_update(2, ALLOWED, "SKIP ")]])
+    session = ChatSession(client, ALLOWED, "hi", _Inbox(), frozenset({ALLOWED}))
+
+    assert session.read() == "hi"
+    assert session.read() == ""  # intake treats blank as "skip this question"
+
+
 # --- telegram rendering ---
 
 
-def _recommendation(title, url, price, tradeoffs=()):
+def _recommendation(title, url, price, tradeoffs=(), reasoning=""):
     from concierge.enums import AgentName
     from concierge.models import AgentScore, Product, Recommendation
 
@@ -207,6 +327,7 @@ def _recommendation(title, url, price, tradeoffs=()):
             ),
         ],
         tradeoffs=list(tradeoffs),
+        reasoning=reasoning,
     )
 
 
@@ -238,9 +359,19 @@ def test_telegram_render_includes_scores_and_tradeoffs():
     assert "⚖️" in out and "budget vs logistics" in out
 
 
+def test_telegram_render_includes_the_consensus_reasoning():
+    """The synthesis line is the most valuable one — the terminal prints it too."""
+    from concierge.formatting import render_telegram
+
+    out = render_telegram(
+        [_recommendation("X", "https://x", 10.0, reasoning="Best value & in stock")]
+    )
+    assert "Best value &amp; in stock" in out
+
+
 def test_write_html_uses_html_parse_mode():
     client = FakeClient()
-    session = ChatSession(client, ALLOWED, "hi", _Offset(), frozenset({ALLOWED}))
+    session = ChatSession(client, ALLOWED, "hi", _Inbox(), frozenset({ALLOWED}))
 
     session.write_html("<b>hi</b>")
     session.write("plain")

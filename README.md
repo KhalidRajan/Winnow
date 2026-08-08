@@ -179,6 +179,14 @@ confirm the bot is live to whoever is probing), and starting without an allowlis
 rather than quietly serving everyone. Messages queued while the bot was offline are dropped on
 startup, so it doesn't wake up answering yesterday's questions.
 
+**One conversation at a time.** The bot is single-threaded: it runs a shopper's conversation to
+completion before picking up the next one, and a conversation that goes quiet holds the loop
+until its 10-minute idle timeout. Messages sent meanwhile aren't lost — they queue and are
+served in order — but a second person on the allowlist may wait. That's fine for a personal bot;
+serving several shoppers concurrently would need a thread or task per chat. Since you can't send
+an empty Telegram message, reply **`skip`** where the terminal would take a blank line to skip a
+question.
+
 Results get their own renderer: the terminal's score bars and padded columns assume a monospace
 font, so Telegram instead gets HTML with the product title as a tappable link, one icon-prefixed
 line per agent, and link previews suppressed.

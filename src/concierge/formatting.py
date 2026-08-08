@@ -95,6 +95,10 @@ def render_telegram(recommendations: list[Recommendation]) -> str:
             lines.append(scores)
         for agent, reason in _reasons_by_agent(rec):
             lines.append(f"{_AGENT_ICON.get(agent, '•')} {html.escape(reason)}")
+        # The consensus/team synthesis — the one line that explains the ranking
+        # rather than any single agent's view.
+        if rec.reasoning:
+            lines.append(f"→ <i>{html.escape(rec.reasoning)}</i>")
         for tradeoff in rec.tradeoffs:
             lines.append(f"⚖️ <i>{html.escape(tradeoff)}</i>")
         blocks.append("\n".join(lines))
