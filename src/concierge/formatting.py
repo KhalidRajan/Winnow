@@ -9,6 +9,18 @@ from concierge.models import Recommendation
 
 # Telegram renders a proportional font, so terminal tricks (block bars, padded
 # columns) turn into noise. Use icons and short lines instead.
+# Telegram caps a message at 4096 characters, and `chunk()` only guarantees a
+# safe split *between* lines — each rendered line is a self-contained element,
+# but a single line longer than the cap gets cut at a raw offset, which can land
+# inside a tag or an entity and get the whole message rejected. Clipping the
+# free-text fields well short of the cap keeps every split on a line boundary.
+_MAX_FIELD = 700
+
+
+def _clip(text: str, limit: int = _MAX_FIELD) -> str:
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
 _AGENT_ICON = {
     AgentName.BUDGET: "💰",
     AgentName.LOGISTICS: "📦",
@@ -77,15 +89,15 @@ def render_telegram(recommendations: list[Recommendation]) -> str:
     blocks: list[str] = []
     for rank, rec in enumerate(recommendations, start=1):
         product = rec.product
-        title = html.escape(product.title)
+        title = html.escape(_clip(product.title))
         heading = (
             f'<a href="{html.escape(product.url, quote=True)}">{title}</a>'
-            if product.url
+            if product.url and len(product.url) <= _MAX_FIELD
             else title
         )
         lines = [
             f"<b>{rank}. {heading}</b>",
-            f"{_price(rec)} · score {rec.final_score:.2f}",
+            f"{html.escape(_price(rec))} · score {rec.final_score:.2f}",
         ]
 
         scores = " · ".join(
@@ -95,13 +107,13 @@ def render_telegram(recommendations: list[Recommendation]) -> str:
         if scores:
             lines.append(scores)
         for agent, reason in _reasons_by_agent(rec):
-            lines.append(f"{_AGENT_ICON.get(agent, '•')} {html.escape(reason)}")
+            lines.append(f"{_AGENT_ICON.get(agent, '•')} {html.escape(_clip(reason))}")
         # The consensus/team synthesis — the one line that explains the ranking
         # rather than any single agent's view.
         if rec.reasoning:
-            lines.append(f"→ <i>{html.escape(rec.reasoning)}</i>")
+            lines.append(f"→ <i>{html.escape(_clip(rec.reasoning))}</i>")
         for tradeoff in rec.tradeoffs:
-            lines.append(f"⚖️ <i>{html.escape(tradeoff)}</i>")
+            lines.append(f"⚖️ <i>{html.escape(_clip(tradeoff))}</i>")
         blocks.append("\n".join(lines))
 
     return "\n\n".join(blocks)

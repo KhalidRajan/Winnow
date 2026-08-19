@@ -305,12 +305,12 @@ def test_skip_token_reads_as_the_blank_line_intake_expects():
 # --- telegram rendering ---
 
 
-def _recommendation(title, url, price, tradeoffs=(), reasoning=""):
+def _recommendation(title, url, price, tradeoffs=(), reasoning="", currency="USD"):
     from concierge.enums import AgentName
     from concierge.models import AgentScore, Product, Recommendation
 
     return Recommendation(
-        product=Product(upid="a", title=title, price=price, currency="USD", url=url),
+        product=Product(upid="a", title=title, price=price, currency=currency, url=url),
         final_score=0.82,
         per_agent=[
             AgentScore(
@@ -377,3 +377,92 @@ def test_write_html_uses_html_parse_mode():
     session.write("plain")
 
     assert client.parse_modes == ["HTML", None]
+
+
+# --- regressions found in review ---
+
+
+def test_apology_never_repeats_the_exception_text():
+    """Pipeline errors quote upstream response bodies; a chat message is forever."""
+    client = FakeClient([[_update(1, ALLOWED, "hi")]])
+
+    def handle(session):
+        raise RuntimeError("Token response missing 'access_token': {'secret': 'oops'}")
+
+    run_bot(_settings(), handle, client=client, drop_pending=False, max_conversations=1)
+
+    apology = client.sent[-1][1]
+    assert "access_token" not in apology and "oops" not in apology
+    assert "went wrong" in apology
+
+
+def test_session_read_rides_out_a_transient_poll_failure():
+    """A blip mid-intake must not discard a conversation already under way."""
+
+    class FlakyClient(FakeClient):
+        def get_updates(self, offset):
+            if not self.offsets:  # fail the first poll only
+                self.offsets.append(offset)
+                raise TelegramError("getUpdates failed: connection reset")
+            return super().get_updates(offset)
+
+    client = FlakyClient([[_update(2, ALLOWED, "a waterproof one")]])
+    slept = []
+    session = ChatSession(
+        client,
+        ALLOWED,
+        "hi",
+        _Inbox(),
+        frozenset({ALLOWED}),
+        sleep=slept.append,
+    )
+
+    assert session.read() == "hi"
+    assert session.read() == "a waterproof one"
+    assert slept  # backed off rather than aborting the conversation
+
+
+def test_session_read_gives_up_after_persistent_poll_failures():
+    class DeadClient(FakeClient):
+        def get_updates(self, offset):
+            raise TelegramError("getUpdates failed: connection reset")
+
+    session = ChatSession(
+        DeadClient(),
+        ALLOWED,
+        "hi",
+        _Inbox(),
+        frozenset({ALLOWED}),
+        sleep=lambda _: None,
+    )
+    session.read()
+    with pytest.raises(TelegramError):
+        session.read()
+
+
+def test_telegram_render_escapes_the_catalog_supplied_currency():
+    from concierge.formatting import render_telegram
+
+    out = render_telegram([_recommendation("X", "https://x", 10.0, currency="<b>USD")])
+    assert "&lt;b&gt;USD" in out and "<b>USD" not in out
+
+
+def test_telegram_render_keeps_every_line_chunkable():
+    """No rendered line may exceed the chunk limit, or a split lands mid-tag."""
+    from concierge.formatting import render_telegram
+    from concierge.telegram import _MAX_MESSAGE, chunk
+
+    out = render_telegram(
+        [
+            _recommendation(
+                "T" * 5000,
+                "https://x/" + "u" * 5000,
+                10.0,
+                tradeoffs=["W" * 5000],
+                reasoning="R" * 5000,
+            )
+        ]
+    )
+    assert all(len(line) <= _MAX_MESSAGE for line in out.splitlines())
+    # every chunk boundary therefore falls between complete elements
+    assert all(piece.count("<b>") == piece.count("</b>") for piece in chunk(out))

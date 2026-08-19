@@ -14,6 +14,7 @@ session just supplies Telegram-flavoured versions; nothing else changes.
 
 from __future__ import annotations
 
+import logging
 import time
 from collections import deque
 from collections.abc import Callable
@@ -24,6 +25,8 @@ import httpx
 
 from concierge.config import ConfigError, Settings
 from concierge.constants import CONVERSATION_TIMEOUT
+
+_log = logging.getLogger(__name__)
 
 _API = "https://api.telegram.org"
 # Telegram hard-caps a message at 4096 characters; leave room for the chunk
@@ -199,6 +202,7 @@ class ChatSession:
         allowed: frozenset[str],
         timeout: float = CONVERSATION_TIMEOUT,
         clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._client = client
         self._chat_id = chat_id
@@ -207,6 +211,7 @@ class ChatSession:
         self._allowed = allowed
         self._timeout = timeout
         self._clock = clock
+        self._sleep = sleep
 
     def read(self, _prompt: str = "") -> str:
         """Return the shopper's next message (the CLI's "> " prompt is dropped)."""
@@ -214,10 +219,22 @@ class ChatSession:
             return _unskip(self._pending.pop(0))
 
         deadline = self._clock() + self._timeout
+        failures = 0
         while self._clock() < deadline:
-            queued = self._inbox.next_message(
-                self._client, self._allowed, chat_id=self._chat_id
-            )
+            try:
+                queued = self._inbox.next_message(
+                    self._client, self._allowed, chat_id=self._chat_id
+                )
+            except (TelegramError, httpx.HTTPError):
+                # Same reasoning as run_bot's outer loop, and it matters more
+                # here: dropping this poll discards a conversation already part
+                # way through intake, not just an idle wait.
+                failures += 1
+                if failures >= _MAX_CONSECUTIVE_POLL_FAILURES:
+                    raise
+                self._sleep(min(_BACKOFF_BASE**failures, _BACKOFF_CAP))
+                continue
+            failures = 0
             if queued is not None:
                 return _unskip(queued[1])
         # Treated by the intake loop as "search with what we have".
@@ -282,9 +299,16 @@ class _Inbox:
 
 
 def _apologise(session: ChatSession, exc: Exception) -> None:
-    """Tell the shopper we failed — but never let *that* failure kill the bot."""
+    """Tell the shopper we failed — but never let *that* failure kill the bot.
+
+    The detail stays in the local log. Anything raised by the pipeline can end
+    up here, and some of it carries the upstream response body — an AuthError
+    quotes the token endpoint verbatim — which a chat message would copy into
+    Telegram's history for good.
+    """
+    _log.exception("conversation failed", exc_info=exc)
     try:
-        session.write(f"Sorry — something went wrong: {exc}")
+        session.write("Sorry — something went wrong. Please try again.")
     except (TelegramError, httpx.HTTPError):
         pass  # can't even apologise; the next poll decides whether we're done
 
