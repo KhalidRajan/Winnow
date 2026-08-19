@@ -46,6 +46,11 @@ _DEFAULT_RETRY_AFTER = 1.0
 _MAX_CONSECUTIVE_POLL_FAILURES = 5
 _BACKOFF_BASE = 2.0
 _BACKOFF_CAP = 60.0
+# A poll that returns nothing *for us* must not re-poll at network speed. Updates
+# from non-allowlisted chats come back immediately and are dropped, so without
+# this pause anyone who can message the bot can spin the loop into Telegram's
+# rate limiter and out through the consecutive-failure budget.
+_EMPTY_POLL_PAUSE = 1.0
 
 
 class TelegramError(Exception):
@@ -152,8 +157,12 @@ class TelegramClient:
             f"{method} still rate-limited after {_MAX_RATE_LIMIT_RETRIES} retries"
         )
 
-    def get_updates(self, offset: int | None) -> list[dict[str, Any]]:
-        payload: dict[str, Any] = {"timeout": self._poll_timeout}
+    def get_updates(
+        self, offset: int | None, timeout: int | None = None
+    ) -> list[dict[str, Any]]:
+        payload: dict[str, Any] = {
+            "timeout": self._poll_timeout if timeout is None else timeout
+        }
         if offset is not None:
             payload["offset"] = offset
         result = self._call("getUpdates", payload)
@@ -172,8 +181,14 @@ class TelegramClient:
             self._call("sendMessage", payload)
 
     def drop_pending(self) -> int | None:
-        """Skip messages queued while the bot was offline; return the next offset."""
-        updates = self.get_updates(offset=-1)
+        """Skip messages queued while the bot was offline; return the next offset.
+
+        ``timeout=0`` makes this a non-blocking drain. A long-poll here would
+        hold startup open for ``_POLL_TIMEOUT`` seconds *after* the caller has
+        announced the bot is running, and would consume — then discard — the
+        first message the shopper sends in that window.
+        """
+        updates = self.get_updates(offset=-1, timeout=0)
         return updates[-1]["update_id"] + 1 if updates else None
 
     def close(self) -> None:
@@ -362,14 +377,20 @@ def run_bot(
                 continue
             failures = 0
             if queued is None:
-                continue  # long-poll came back empty; go round again
+                # Nothing for an allowlisted chat. Pause before polling again;
+                # see _EMPTY_POLL_PAUSE for why this must not be a bare continue.
+                sleep(_EMPTY_POLL_PAUSE)
+                continue
 
             chat_id, text = queued
             session = ChatSession(client, chat_id, text, inbox, allowed, sleep=sleep)
             try:
                 handle(session)
             except EOFError:
-                pass  # shopper went quiet; wait for the next conversation
+                # Defensive only: collect_query_llm catches the read deadline's
+                # EOFError itself and searches with the slots it has, so this
+                # does not fire for the current handler.
+                pass
             except Exception as exc:  # noqa: BLE001 - one bad chat can't kill the bot
                 _apologise(session, exc)
             handled += 1

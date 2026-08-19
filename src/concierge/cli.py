@@ -138,6 +138,13 @@ def main(argv: list[str] | None = None) -> int:
         except ConfigError as exc:
             print(f"Configuration error: {exc}", file=sys.stderr)
             return 1
+        except telegram.TelegramError as exc:
+            print(f"Telegram bot stopped: {exc}", file=sys.stderr)
+            return 1
+        except KeyboardInterrupt:
+            # The startup banner tells the operator to stop with Ctrl-C.
+            print("\nStopped.", file=sys.stderr)
+            return 0
 
     if args.interactive:
         if model is None:

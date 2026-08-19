@@ -5,8 +5,11 @@ from concierge.enums import AgentName
 from concierge.formatting import render_telegram
 from concierge.models import AgentScore, Product, Recommendation
 from concierge.telegram import (
+    _EMPTY_POLL_PAUSE,
     _MAX_MESSAGE,
+    _POLL_TIMEOUT,
     ChatSession,
+    TelegramClient,
     TelegramError,
     _Inbox,
     chunk,
@@ -52,6 +55,31 @@ class FakeClient:
 
     def drop_pending(self):
         return None
+
+
+class _RecordingHttp:
+    """Captures the raw Bot API payloads TelegramClient posts."""
+
+    def __init__(self, results=None):
+        self.calls = []
+        self._results = list(results or [])
+
+    def post(self, url, json):
+        self.calls.append((url.rsplit("/", 1)[-1], json))
+        payload = self._results.pop(0) if self._results else []
+
+        class _Response:
+            status_code = 200
+            text = "{}"
+
+            @staticmethod
+            def json():
+                return {"ok": True, "result": payload}
+
+        return _Response()
+
+    def close(self):
+        pass
 
 
 # --- config ---
@@ -439,18 +467,72 @@ def test_telegram_render_escapes_the_catalog_supplied_currency():
 
 
 def test_telegram_render_keeps_every_line_chunkable():
-    """No rendered line may exceed the chunk limit, or a split lands mid-tag."""
+    """No rendered line may exceed the chunk limit, or a split lands mid-tag.
+
+    The filler is apostrophes deliberately: ``html.escape`` turns each into
+    ``&#x27;``, so a field bounded *before* escaping still renders six times over
+    the limit. Inert filler such as ``"T" * 5000`` satisfies this assertion even
+    when the bound is applied in the wrong place, which is how it passed while
+    the renderer was producing 4210-character lines.
+    """
     out = render_telegram(
         [
             _recommendation(
-                "T" * 5000,
-                "https://x/" + "u" * 5000,
+                "'" * 5000,
+                "https://x/" + "'" * 5000,
                 10.0,
-                tradeoffs=["W" * 5000],
-                reasoning="R" * 5000,
+                tradeoffs=["'" * 5000],
+                reasoning="'" * 5000,
             )
         ]
     )
+    assert "&#x27;" in out  # the filler really did expand under escaping
     assert all(len(line) <= _MAX_MESSAGE for line in out.splitlines())
-    # every chunk boundary therefore falls between complete elements
-    assert all(piece.count("<b>") == piece.count("</b>") for piece in chunk(out))
+
+
+def test_telegram_chunks_split_between_complete_elements():
+    """A shortlist long enough to need several chunks keeps every tag balanced."""
+    out = render_telegram([_recommendation("'" * 400, "https://x", 10.0)] * 12)
+    pieces = chunk(out)
+    assert len(pieces) > 1  # the properties below are vacuous on a single chunk
+    for piece in pieces:
+        assert piece.count("<b>") == piece.count("</b>")
+        assert piece.count("<i>") == piece.count("</i>")
+        assert "&#x2" not in piece[-6:]  # no half-written entity at a boundary
+
+
+def test_drop_pending_drains_without_long_polling():
+    """A long-poll here stalls startup and eats the first message sent after it."""
+    http = _RecordingHttp()
+    TelegramClient("tok", http_client=http).drop_pending()
+
+    method, payload = http.calls[0]
+    assert method == "getUpdates"
+    assert payload["offset"] == -1
+    assert payload["timeout"] == 0  # not _POLL_TIMEOUT
+
+
+def test_normal_polling_still_uses_the_long_poll_timeout():
+    """Only the startup drain is non-blocking; ordinary polls still wait."""
+    http = _RecordingHttp()
+    TelegramClient("tok", http_client=http).get_updates(offset=7)
+
+    assert http.calls[0][1]["timeout"] == _POLL_TIMEOUT
+
+
+def test_an_empty_poll_pauses_before_polling_again():
+    """Without this a stranger's traffic spins the loop into the rate limiter."""
+    # Empty batches stand in for updates that were drained and then filtered out
+    # because the chat is not allowlisted.
+    client = FakeClient([[], [], [_update(1, ALLOWED, "hi")]])
+    slept = []
+    run_bot(
+        _settings(),
+        lambda session: session.read(),
+        client=client,
+        drop_pending=False,
+        max_conversations=1,
+        sleep=slept.append,
+    )
+
+    assert slept == [_EMPTY_POLL_PAUSE, _EMPTY_POLL_PAUSE]

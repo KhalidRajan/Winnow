@@ -12,13 +12,33 @@ from concierge.models import Recommendation
 # Telegram caps a message at 4096 characters, and `chunk()` only guarantees a
 # safe split *between* lines — each rendered line is a self-contained element,
 # but a single line longer than the cap gets cut at a raw offset, which can land
-# inside a tag or an entity and get the whole message rejected. Clipping the
-# free-text fields well short of the cap keeps every split on a line boundary.
+# inside a tag or an entity and get the whole message rejected. So every
+# free-text field is bounded *after* escaping: `html.escape` expands by up to 6x
+# (`'` -> `&#x27;`), so clipping the raw string leaves the rendered line
+# unbounded, which is how a 700-char field became a 4210-char line.
 _MAX_FIELD = 700
+# An HTML character reference runs from "&" to ";". Truncating between the two
+# leaves a fragment Telegram rejects for the whole message, so the clip backs off
+# past an unterminated one.
+_ENTITY_START = "&"
+_ENTITY_END = ";"
 
 
-def _clip(text: str, limit: int = _MAX_FIELD) -> str:
-    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+def _clip_escaped(text: str, limit: int = _MAX_FIELD) -> str:
+    """HTML-escape ``text``, then bound the *escaped* length.
+
+    Truncating escaped text is what makes this fiddly: cutting at a raw offset
+    can leave a half-written entity (`&#x2`), which Telegram rejects for the
+    whole message. So back off to before the trailing unterminated `&`.
+    """
+    escaped = html.escape(text)
+    if len(escaped) <= limit:
+        return escaped
+    cut = escaped[: limit - 1]
+    entity = cut.rfind(_ENTITY_START)
+    if entity != -1 and _ENTITY_END not in cut[entity:]:
+        cut = cut[:entity]
+    return cut.rstrip() + "…"
 
 
 _AGENT_ICON = {
@@ -89,15 +109,19 @@ def render_telegram(recommendations: list[Recommendation]) -> str:
     blocks: list[str] = []
     for rank, rec in enumerate(recommendations, start=1):
         product = rec.product
-        title = html.escape(_clip(product.title))
+        title = _clip_escaped(product.title)
+        # A clipped URL would be a broken link, so an over-long one drops the
+        # wrapper entirely rather than being truncated. Measured after escaping,
+        # for the same reason the fields are.
+        escaped_url = html.escape(product.url, quote=True) if product.url else ""
         heading = (
-            f'<a href="{html.escape(product.url, quote=True)}">{title}</a>'
-            if product.url and len(product.url) <= _MAX_FIELD
+            f'<a href="{escaped_url}">{title}</a>'
+            if escaped_url and len(escaped_url) <= _MAX_FIELD
             else title
         )
         lines = [
             f"<b>{rank}. {heading}</b>",
-            f"{html.escape(_price(rec))} · score {rec.final_score:.2f}",
+            f"{_clip_escaped(_price(rec))} · score {rec.final_score:.2f}",
         ]
 
         scores = " · ".join(
@@ -107,13 +131,13 @@ def render_telegram(recommendations: list[Recommendation]) -> str:
         if scores:
             lines.append(scores)
         for agent, reason in _reasons_by_agent(rec):
-            lines.append(f"{_AGENT_ICON.get(agent, '•')} {html.escape(_clip(reason))}")
+            lines.append(f"{_AGENT_ICON.get(agent, '•')} {_clip_escaped(reason)}")
         # The consensus/team synthesis — the one line that explains the ranking
         # rather than any single agent's view.
         if rec.reasoning:
-            lines.append(f"→ <i>{html.escape(_clip(rec.reasoning))}</i>")
+            lines.append(f"→ <i>{_clip_escaped(rec.reasoning)}</i>")
         for tradeoff in rec.tradeoffs:
-            lines.append(f"⚖️ <i>{html.escape(_clip(tradeoff))}</i>")
+            lines.append(f"⚖️ <i>{_clip_escaped(tradeoff)}</i>")
         blocks.append("\n".join(lines))
 
     return "\n\n".join(blocks)
