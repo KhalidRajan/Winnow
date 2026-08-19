@@ -1,7 +1,11 @@
 import pytest
 
 from concierge.config import ConfigError, Settings
+from concierge.enums import AgentName
+from concierge.formatting import render_telegram
+from concierge.models import AgentScore, Product, Recommendation
 from concierge.telegram import (
+    _MAX_MESSAGE,
     ChatSession,
     TelegramError,
     _Inbox,
@@ -306,9 +310,6 @@ def test_skip_token_reads_as_the_blank_line_intake_expects():
 
 
 def _recommendation(title, url, price, tradeoffs=(), reasoning="", currency="USD"):
-    from concierge.enums import AgentName
-    from concierge.models import AgentScore, Product, Recommendation
-
     return Recommendation(
         product=Product(upid="a", title=title, price=price, currency=currency, url=url),
         final_score=0.82,
@@ -332,8 +333,6 @@ def _recommendation(title, url, price, tradeoffs=(), reasoning="", currency="USD
 
 
 def test_telegram_render_links_the_title_instead_of_dumping_the_url():
-    from concierge.formatting import render_telegram
-
     out = render_telegram(
         [_recommendation("Oud Candle", "https://shop/p?a=1&b=2", 25.5)]
     )
@@ -343,15 +342,11 @@ def test_telegram_render_links_the_title_instead_of_dumping_the_url():
 
 
 def test_telegram_render_escapes_html_in_titles_and_reasons():
-    from concierge.formatting import render_telegram
-
     out = render_telegram([_recommendation("Tom & Jerry <b>", "https://x", 10.0)])
     assert "Tom &amp; Jerry &lt;b&gt;" in out
 
 
 def test_telegram_render_includes_scores_and_tradeoffs():
-    from concierge.formatting import render_telegram
-
     out = render_telegram(
         [_recommendation("X", "https://x", 10.0, ["budget vs logistics"])]
     )
@@ -361,8 +356,6 @@ def test_telegram_render_includes_scores_and_tradeoffs():
 
 def test_telegram_render_includes_the_consensus_reasoning():
     """The synthesis line is the most valuable one — the terminal prints it too."""
-    from concierge.formatting import render_telegram
-
     out = render_telegram(
         [_recommendation("X", "https://x", 10.0, reasoning="Best value & in stock")]
     )
@@ -441,17 +434,12 @@ def test_session_read_gives_up_after_persistent_poll_failures():
 
 
 def test_telegram_render_escapes_the_catalog_supplied_currency():
-    from concierge.formatting import render_telegram
-
     out = render_telegram([_recommendation("X", "https://x", 10.0, currency="<b>USD")])
     assert "&lt;b&gt;USD" in out and "<b>USD" not in out
 
 
 def test_telegram_render_keeps_every_line_chunkable():
     """No rendered line may exceed the chunk limit, or a split lands mid-tag."""
-    from concierge.formatting import render_telegram
-    from concierge.telegram import _MAX_MESSAGE, chunk
-
     out = render_telegram(
         [
             _recommendation(

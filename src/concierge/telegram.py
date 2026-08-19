@@ -106,6 +106,11 @@ def _retry_after(response: httpx.Response) -> float:
         return _DEFAULT_RETRY_AFTER
 
 
+def _backoff_delay(failures: int) -> float:
+    """Exponential backoff for consecutive poll failures, capped."""
+    return min(_BACKOFF_BASE**failures, _BACKOFF_CAP)
+
+
 class TelegramClient:
     """Minimal Bot API client — just the two calls we need."""
 
@@ -232,7 +237,7 @@ class ChatSession:
                 failures += 1
                 if failures >= _MAX_CONSECUTIVE_POLL_FAILURES:
                     raise
-                self._sleep(min(_BACKOFF_BASE**failures, _BACKOFF_CAP))
+                self._sleep(_backoff_delay(failures))
                 continue
             failures = 0
             if queued is not None:
@@ -240,13 +245,17 @@ class ChatSession:
         # Treated by the intake loop as "search with what we have".
         raise EOFError("no reply from the shopper")
 
-    def write(self, text: str, parse_mode: str | None = None) -> None:
+    def _send(self, text: str, parse_mode: str | None = None) -> None:
         if text and text.strip():
             self._client.send_message(self._chat_id, text, parse_mode=parse_mode)
 
+    def write(self, text: str) -> None:
+        """Send plain text. Signature matches ``interactive.Writer`` exactly."""
+        self._send(text)
+
     def write_html(self, text: str) -> None:
         """Send HTML-formatted output (the rendered shortlist)."""
-        self.write(text, parse_mode="HTML")
+        self._send(text, parse_mode="HTML")
 
 
 class _Inbox:
@@ -315,7 +324,7 @@ def _apologise(session: ChatSession, exc: Exception) -> None:
 
 def run_bot(
     settings: Settings,
-    handle: Any,
+    handle: Callable[[ChatSession], None],
     client: TelegramClient | None = None,
     drop_pending: bool = True,
     max_conversations: int | None = None,
@@ -331,32 +340,39 @@ def run_bot(
     after ``_MAX_CONSECUTIVE_POLL_FAILURES`` in a row.
     """
     token, allowed = require_telegram_settings(settings)
+    # Only a client we created is ours to close; an injected one is the caller's.
+    owned_client = client is None
     client = client or TelegramClient(token)
-    inbox = _Inbox(client.drop_pending() if drop_pending else None)
+    try:
+        inbox = _Inbox(client.drop_pending() if drop_pending else None)
 
-    handled = 0
-    failures = 0
-    while max_conversations is None or handled < max_conversations:
-        try:
-            queued = inbox.next_message(client, allowed)
-        except (TelegramError, httpx.HTTPError) as exc:
-            failures += 1
-            if failures >= _MAX_CONSECUTIVE_POLL_FAILURES:
-                raise TelegramError(
-                    f"giving up after {failures} consecutive polling failures: {exc}"
-                ) from exc
-            sleep(min(_BACKOFF_BASE**failures, _BACKOFF_CAP))
-            continue
+        handled = 0
         failures = 0
-        if queued is None:
-            continue  # long-poll came back empty; go round again
+        while max_conversations is None or handled < max_conversations:
+            try:
+                queued = inbox.next_message(client, allowed)
+            except (TelegramError, httpx.HTTPError) as exc:
+                failures += 1
+                if failures >= _MAX_CONSECUTIVE_POLL_FAILURES:
+                    raise TelegramError(
+                        f"giving up after {failures} consecutive polling "
+                        f"failures: {exc}"
+                    ) from exc
+                sleep(_backoff_delay(failures))
+                continue
+            failures = 0
+            if queued is None:
+                continue  # long-poll came back empty; go round again
 
-        chat_id, text = queued
-        session = ChatSession(client, chat_id, text, inbox, allowed)
-        try:
-            handle(session)
-        except EOFError:
-            pass  # shopper went quiet; wait for the next conversation
-        except Exception as exc:  # noqa: BLE001 - one bad chat must not kill the bot
-            _apologise(session, exc)
-        handled += 1
+            chat_id, text = queued
+            session = ChatSession(client, chat_id, text, inbox, allowed, sleep=sleep)
+            try:
+                handle(session)
+            except EOFError:
+                pass  # shopper went quiet; wait for the next conversation
+            except Exception as exc:  # noqa: BLE001 - one bad chat can't kill the bot
+                _apologise(session, exc)
+            handled += 1
+    finally:
+        if owned_client:
+            client.close()

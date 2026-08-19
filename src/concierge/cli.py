@@ -6,7 +6,6 @@ import argparse
 import logging
 import re
 import sys
-from typing import Any
 
 from concierge import formatting, interactive, telegram, workflow
 from concierge.agents.intake import build_intake_agent
@@ -80,7 +79,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def run_telegram(
-    settings: Settings, client: McpClient, model: object, args: Any
+    settings: Settings, client: McpClient, model: object, args: argparse.Namespace
 ) -> int:
     """Serve the same pipeline over a Telegram chat (long-polling, allowlisted)."""
     # Validate before announcing anything, so a misconfigured bot never prints
