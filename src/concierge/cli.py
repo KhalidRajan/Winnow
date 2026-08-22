@@ -119,6 +119,12 @@ def main(argv: list[str] | None = None) -> int:
     # recovers, which garbles the conversation. Our own failures surface as
     # exceptions (ConfigError, McpError, TeamError), so silence its logger.
     logging.getLogger("agno").setLevel(logging.CRITICAL)
+    # httpx logs every request line at INFO, and the Telegram bot token lives in
+    # the request path (`/bot<TOKEN>/getUpdates`). Its logger is already at INFO,
+    # so the only thing withholding the credential today is that nothing has
+    # attached a handler — one logging.basicConfig() anywhere would start
+    # writing the token to the operator's log once per poll, forever.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     try:
         settings = Settings.load()

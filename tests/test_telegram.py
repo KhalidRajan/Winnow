@@ -5,8 +5,10 @@ from concierge.enums import AgentName
 from concierge.formatting import render_telegram
 from concierge.models import AgentScore, Product, Recommendation
 from concierge.telegram import (
+    _DEFAULT_RETRY_AFTER,
     _EMPTY_POLL_PAUSE,
     _MAX_MESSAGE,
+    _MAX_RATE_LIMIT_RETRIES,
     _POLL_TIMEOUT,
     ChatSession,
     TelegramClient,
@@ -536,3 +538,162 @@ def test_an_empty_poll_pauses_before_polling_again():
     )
 
     assert slept == [_EMPTY_POLL_PAUSE, _EMPTY_POLL_PAUSE]
+
+
+# --- round-2 regressions: the error taxonomy at the Bot API seam ---
+
+
+class _StubResponse:
+    def __init__(self, status_code, text, payload, raises):
+        self.status_code = status_code
+        self.text = text
+        self._payload = payload
+        self._raises = raises
+
+    def json(self):
+        if self._raises:
+            raise ValueError("Expecting value: line 1 column 1 (char 0)")
+        return self._payload
+
+
+class _ScriptedHttp:
+    """Posts a fixed status/body, so _call's error taxonomy can be exercised."""
+
+    def __init__(self, status_code=200, text="{}", payload=None, raises_json=False):
+        self.calls = 0
+        self._response = _StubResponse(status_code, text, payload, raises_json)
+
+    def post(self, url, json):
+        self.calls += 1
+        return self._response
+
+    def close(self):
+        pass
+
+
+def test_a_non_json_200_becomes_a_telegram_error():
+    """A captive portal answers 200 with HTML.
+
+    json.JSONDecodeError is a ValueError, which neither poll loop catches, so
+    before this it escaped run_bot entirely and killed a days-long bot on the
+    first blip instead of counting against the retry budget.
+    """
+    client = TelegramClient(
+        "tok", http_client=_ScriptedHttp(text="<html>portal</html>", raises_json=True)
+    )
+    with pytest.raises(TelegramError) as exc:
+        client.get_updates(offset=None)
+    assert "non-JSON" in str(exc.value)
+    # The page itself must not be pasted into the error, which the poll loop logs.
+    assert "portal" not in str(exc.value)
+
+
+def test_a_json_body_that_is_not_an_object_becomes_a_telegram_error():
+    client = TelegramClient("tok", http_client=_ScriptedHttp(payload=["ok"]))
+    with pytest.raises(TelegramError, match="not a JSON object"):
+        client.get_updates(offset=None)
+
+
+def test_get_updates_rejects_a_result_that_is_not_a_list():
+    """list({...}) would silently yield key strings and blow up later in _Inbox."""
+    client = TelegramClient(
+        "tok", http_client=_ScriptedHttp(payload={"ok": True, "result": {"a": 1}})
+    )
+    with pytest.raises(TelegramError, match="not a list"):
+        client.get_updates(offset=None)
+
+
+def test_an_update_without_an_update_id_is_skipped_not_fatal():
+    inbox = _Inbox()
+    client = FakeClient([[{"message": {"chat": {"id": ALLOWED}, "text": "hi"}}]])
+    assert inbox.next_message(client, frozenset({ALLOWED})) is None
+    assert inbox.offset is None
+
+
+def test_rate_limit_exhaustion_reports_giving_up_rather_than_the_raw_status():
+    """The final 429 used to fall through to the generic status check.
+
+    That told the operator "returned 429" — indistinguishable from a single
+    unexpected throttle — and made the exhaustion message dead code.
+    """
+    http = _ScriptedHttp(
+        status_code=429,
+        text='{"ok":false,"error_code":429}',
+        payload={"ok": False, "error_code": 429, "parameters": {"retry_after": 0}},
+    )
+    slept = []
+    client = TelegramClient("tok", http_client=http, sleep=slept.append)
+    with pytest.raises(TelegramError, match="still rate-limited"):
+        client.get_updates(offset=None)
+    assert http.calls == _MAX_RATE_LIMIT_RETRIES + 1
+    assert len(slept) == _MAX_RATE_LIMIT_RETRIES
+
+
+def test_session_read_pauses_when_a_poll_yields_nothing_for_this_chat():
+    """Occurrence 2 of the stranger-flood spin: run_bot was fixed, read was not.
+
+    A stranger's updates come back immediately and are dropped, so without the
+    pause this loop re-polls at network speed for as long as they keep sending.
+    """
+    client = FakeClient(
+        [[_update(1, STRANGER, "spam")], [_update(2, STRANGER, "spam")]]
+    )
+    slept = []
+    session = ChatSession(
+        client,
+        ALLOWED,
+        "hi",
+        _Inbox(),
+        frozenset({ALLOWED}),
+        timeout=10.0,
+        clock=iter([0.0, 1.0, 2.0, 99.0]).__next__,
+        sleep=slept.append,
+    )
+
+    assert session.read() == "hi"  # the pending first message, no polling
+    with pytest.raises(EOFError):
+        session.read()
+
+    assert slept == [_EMPTY_POLL_PAUSE, _EMPTY_POLL_PAUSE]
+
+
+def test_a_retry_after_body_that_is_not_an_object_falls_back_to_the_default():
+    """_retry_after guarded the decode but not the shape; a JSON null raised."""
+    http = _ScriptedHttp(status_code=429, text="null", payload=None)
+    slept = []
+    client = TelegramClient("tok", http_client=http, sleep=slept.append)
+    with pytest.raises(TelegramError, match="still rate-limited"):
+        client.get_updates(offset=None)
+    assert slept == [_DEFAULT_RETRY_AFTER] * _MAX_RATE_LIMIT_RETRIES
+
+
+def test_a_non_web_url_is_rendered_as_plain_text_not_a_link():
+    """Telegram 400s the whole message on an href scheme it will not parse."""
+    out = render_telegram([_recommendation("Candle", "javascript:alert(1)", 25.0)])
+    assert "<a href=" not in out
+    assert "javascript:" not in out
+    assert "Candle" in out
+
+
+def test_a_web_url_is_still_wrapped_in_a_link():
+    out = render_telegram([_recommendation("Candle", "https://shop/p", 25.0)])
+    assert '<a href="https://shop/p">' in out
+
+
+def test_bot_token_is_stripped(monkeypatch):
+    """A token pasted with a trailing newline is truthy, so it fails much later."""
+    for name in ("SHOPIFY_CLIENT_ID", "SHOPIFY_CLIENT_SECRET", "LLM_API_KEY"):
+        monkeypatch.setenv(name, "x")
+    monkeypatch.setenv("AGENT_PROFILE_URL", "https://example.com/profile.json")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "  123:abc\n")
+    assert Settings.load().telegram_bot_token == "123:abc"
+
+
+def test_a_whitespace_only_bot_token_still_fails_loud(monkeypatch):
+    for name in ("SHOPIFY_CLIENT_ID", "SHOPIFY_CLIENT_SECRET", "LLM_API_KEY"):
+        monkeypatch.setenv(name, "x")
+    monkeypatch.setenv("AGENT_PROFILE_URL", "https://example.com/profile.json")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "   ")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", ALLOWED)
+    with pytest.raises(ConfigError, match="TELEGRAM_BOT_TOKEN"):
+        require_telegram_settings(Settings.load())

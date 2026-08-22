@@ -104,6 +104,8 @@ def _retry_after(response: httpx.Response) -> float:
         body = response.json()
     except ValueError:
         return _DEFAULT_RETRY_AFTER
+    if not isinstance(body, dict):
+        return _DEFAULT_RETRY_AFTER
     value: Any = (body.get("parameters") or {}).get("retry_after")
     try:
         return max(0.0, float(value))
@@ -114,6 +116,17 @@ def _retry_after(response: httpx.Response) -> float:
 def _backoff_delay(failures: int) -> float:
     """Exponential backoff for consecutive poll failures, capped."""
     return min(_BACKOFF_BASE**failures, _BACKOFF_CAP)
+
+
+def _update_id(update: dict[str, Any]) -> int | None:
+    """``update_id`` when it is the integer Telegram promises, else ``None``.
+
+    Same reasoning as ``_message_of`` one screen down: the offset arithmetic is
+    the one place a missing or oddly-typed key would raise past both poll loops
+    instead of counting as a poll failure.
+    """
+    update_id = update.get("update_id")
+    return update_id if isinstance(update_id, int) else None
 
 
 class TelegramClient:
@@ -139,17 +152,33 @@ class TelegramClient:
                 response = self._client.post(f"{self._base}/{method}", json=payload)
             except httpx.HTTPError as exc:
                 raise TelegramError(f"{method} failed: {exc}") from exc
-            if (
-                response.status_code == HTTPStatus.TOO_MANY_REQUESTS
-                and attempt < _MAX_RATE_LIMIT_RETRIES
-            ):
+            if response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
+                # Exhaustion has to leave by the loop's own exit, or the final
+                # 429 falls through to the generic status check below and the
+                # operator is told "returned 429" instead of that we gave up
+                # retrying.
+                if attempt == _MAX_RATE_LIMIT_RETRIES:
+                    break
                 self._sleep(_retry_after(response))
                 continue
             if response.status_code != HTTPStatus.OK:
                 raise TelegramError(
                     f"{method} returned {response.status_code}: {response.text}"
                 )
-            body = response.json()
+            try:
+                body = response.json()
+            except ValueError as exc:
+                # A 200 that isn't JSON is a captive portal or an intercepting
+                # proxy — exactly what a laptop bot meets. It must arrive as a
+                # TelegramError: the poll loops retry on that, whereas the bare
+                # ValueError this raises escapes both their except tuples and
+                # kills a process meant to run for days. Deliberately not
+                # quoting the body, which is typically a whole HTML page.
+                raise TelegramError(f"{method} returned a non-JSON body") from exc
+            if not isinstance(body, dict):
+                raise TelegramError(
+                    f"{method} returned {type(body).__name__}, not a JSON object"
+                )
             if not body.get("ok"):
                 raise TelegramError(f"{method} error: {body}")
             return body.get("result")
@@ -166,7 +195,16 @@ class TelegramClient:
         if offset is not None:
             payload["offset"] = offset
         result = self._call("getUpdates", payload)
-        return list(result or [])
+        if result is None:
+            return []
+        # The declared return type is a claim about someone else's payload, so
+        # check it here rather than letting a surprise shape reach _Inbox as an
+        # AttributeError/TypeError that no poll loop catches.
+        if not isinstance(result, list):
+            raise TelegramError(
+                f"getUpdates returned {type(result).__name__}, not a list"
+            )
+        return [update for update in result if isinstance(update, dict)]
 
     def send_message(
         self, chat_id: str, text: str, parse_mode: str | None = None
@@ -189,7 +227,11 @@ class TelegramClient:
         first message the shopper sends in that window.
         """
         updates = self.get_updates(offset=-1, timeout=0)
-        return updates[-1]["update_id"] + 1 if updates else None
+        for update in reversed(updates):
+            update_id = _update_id(update)
+            if update_id is not None:
+                return update_id + 1
+        return None
 
     def close(self) -> None:
         self._client.close()
@@ -257,6 +299,12 @@ class ChatSession:
             failures = 0
             if queued is not None:
                 return _unskip(queued[1])
+            # Nothing for *this* chat. The same pause run_bot takes, and for the
+            # same reason: a non-allowlisted chat's updates return immediately
+            # and are dropped, so without this the loop re-polls at network
+            # speed for as long as a stranger keeps sending. See
+            # _EMPTY_POLL_PAUSE.
+            self._sleep(_EMPTY_POLL_PAUSE)
         # Treated by the intake loop as "search with what we have".
         raise EOFError("no reply from the shopper")
 
@@ -290,7 +338,10 @@ class _Inbox:
 
     def _fill(self, client: TelegramClient, allowed: frozenset[str]) -> None:
         for update in client.get_updates(self.offset):
-            self.offset = update["update_id"] + 1
+            update_id = _update_id(update)
+            if update_id is None:
+                continue
+            self.offset = update_id + 1
             parsed = _message_of(update)
             if parsed is None:
                 continue

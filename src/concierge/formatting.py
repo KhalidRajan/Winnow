@@ -41,6 +41,11 @@ def _clip_escaped(text: str, limit: int = _MAX_FIELD) -> str:
     return cut.rstrip() + "…"
 
 
+def _is_web_url(url: str | None) -> bool:
+    """True for the only two schemes Telegram will render as a product link."""
+    return url is not None and url.lower().startswith(("http://", "https://"))
+
+
 _AGENT_ICON = {
     AgentName.BUDGET: "💰",
     AgentName.LOGISTICS: "📦",
@@ -113,7 +118,15 @@ def render_telegram(recommendations: list[Recommendation]) -> str:
         # A clipped URL would be a broken link, so an over-long one drops the
         # wrapper entirely rather than being truncated. Measured after escaping,
         # for the same reason the fields are.
-        escaped_url = html.escape(product.url, quote=True) if product.url else ""
+        #
+        # The scheme is checked first because escaping only stops attribute
+        # breakout: it does not stop the catalog handing us a scheme Telegram
+        # refuses, which 400s the *whole* message and costs the entire
+        # shortlist, nor one it renders as a link to somewhere the title does
+        # not describe. Same degradation as the length guard — fall back to
+        # plain text.
+        usable_url = product.url if _is_web_url(product.url) else ""
+        escaped_url = html.escape(usable_url, quote=True) if usable_url else ""
         heading = (
             f'<a href="{escaped_url}">{title}</a>'
             if escaped_url and len(escaped_url) <= _MAX_FIELD
