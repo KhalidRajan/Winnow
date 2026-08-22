@@ -56,8 +56,8 @@ Agno agents for deterministic scoring so the whole pipeline runs without a model
 
 - **Keep the pure core framework-independent.** `config`, `models`, `features`, `consensus`,
   `auth`, `mcp_client`, `catalog`, `constants` must NOT import Agno. Agno is confined to `agents/`,
-  `workflow.py`, and `model_factory.py`. This keeps the recommendation logic testable without a
-  key/network and makes framework swaps cheap.
+  `workflow.py`, `model_factory.py`, and `team.py` (the `--team` variant). This keeps the
+  recommendation logic testable without a key/network and makes framework swaps cheap.
 - **LLM = OpenRouter by default** (`llm_provider="openrouter"`, key in `LLM_API_KEY`). Switch
   models via `LLM_MODEL` (e.g. `anthropic/claude-opus-4-8`, `openai/gpt-4o`) with no code change.
 - **Defensive parsing at integration seams.** The Global Catalog response shape and the auth
