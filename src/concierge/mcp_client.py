@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from http import HTTPStatus
 from typing import Any
 
 import httpx
@@ -17,7 +18,16 @@ import httpx
 from concierge.auth import TokenProvider
 from concierge.config import Settings
 
-_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+# Throttling plus the 5xx family that means "try again" rather than "you asked
+# wrong". HTTPStatus is an IntEnum, so a plain ``response.status_code`` int still
+# matches on membership.
+_RETRYABLE_STATUS = {
+    HTTPStatus.TOO_MANY_REQUESTS,
+    HTTPStatus.INTERNAL_SERVER_ERROR,
+    HTTPStatus.BAD_GATEWAY,
+    HTTPStatus.SERVICE_UNAVAILABLE,
+    HTTPStatus.GATEWAY_TIMEOUT,
+}
 _MAX_ATTEMPTS = 3
 _BACKOFF_BASE = 0.5
 

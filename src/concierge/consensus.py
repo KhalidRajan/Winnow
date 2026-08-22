@@ -5,12 +5,9 @@ Pure functions: no network, no LLM, no framework.
 
 from __future__ import annotations
 
+from concierge.constants import TRADEOFF_THRESHOLD
 from concierge.enums import AgentName
 from concierge.models import AgentScore, Product, Recommendation
-
-# Minimum spread between the highest and lowest agent score for a product before
-# we surface it as an explicit trade-off.
-_TRADEOFF_THRESHOLD = 0.3
 
 
 def _normalize_weights(weights: dict[AgentName, float]) -> dict[AgentName, float]:
@@ -28,7 +25,7 @@ def _detect_tradeoffs(agent_scores: list[AgentScore]) -> list[str]:
         return []
     high = max(agent_scores, key=lambda s: s.score)
     low = min(agent_scores, key=lambda s: s.score)
-    if high.score - low.score >= _TRADEOFF_THRESHOLD:
+    if high.score - low.score >= TRADEOFF_THRESHOLD:
         note = (
             f"{high.agent} rates this {high.score:.2f} "
             f"but {low.agent} only {low.score:.2f}"

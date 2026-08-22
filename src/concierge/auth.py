@@ -10,15 +10,12 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable
+from http import HTTPStatus
 
 import httpx
 
 from concierge.config import Settings
-
-# Refresh this many seconds before the token actually expires, so an in-flight
-# request never races the expiry boundary.
-_EXPIRY_SAFETY_MARGIN = 60.0
-_DEFAULT_TTL = 3600.0
+from concierge.constants import TOKEN_DEFAULT_TTL, TOKEN_EXPIRY_MARGIN
 
 
 class AuthError(Exception):
@@ -57,7 +54,7 @@ class TokenProvider:
 
             token, ttl = self._fetch()
             self._token = token
-            self._expires_at = self._clock() + max(0.0, ttl - _EXPIRY_SAFETY_MARGIN)
+            self._expires_at = self._clock() + max(0.0, ttl - TOKEN_EXPIRY_MARGIN)
             return token
 
     def _fetch(self) -> tuple[str, float]:
@@ -75,7 +72,7 @@ class TokenProvider:
         except httpx.HTTPError as exc:
             raise AuthError(f"Token request failed: {exc}") from exc
 
-        if response.status_code != 200:
+        if response.status_code != HTTPStatus.OK:
             raise AuthError(
                 f"Token endpoint returned {response.status_code}: {response.text}"
             )
@@ -86,9 +83,9 @@ class TokenProvider:
             raise AuthError(f"Token response missing 'access_token': {payload}")
 
         try:
-            ttl = float(payload.get("expires_in", _DEFAULT_TTL))
+            ttl = float(payload.get("expires_in", TOKEN_DEFAULT_TTL))
         except (TypeError, ValueError):
-            ttl = _DEFAULT_TTL
+            ttl = TOKEN_DEFAULT_TTL
         return token, ttl
 
     def close(self) -> None:

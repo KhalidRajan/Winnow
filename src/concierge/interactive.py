@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+from concierge.constants import MAX_INTAKE_TURNS
 from concierge.enums import AgentName
 from concierge.models import IntakeState, Query
 
@@ -22,9 +23,6 @@ Writer = Callable[[str], None]
 # per-agent memory. Injectable so tests can drive the chat without a real model.
 AgentFactory = Callable[[], Any]
 
-# One opening message plus at most three follow-ups. Intake should feel brief;
-# the agent is told to spend its questions on budget/destination first.
-_MAX_TURNS = 4
 _SKIPPED = "(skipped — no preference)"
 
 _PRIORITY_WEIGHTS: dict[str, dict[AgentName, float]] = {
@@ -66,16 +64,20 @@ def collect_query_llm(
     agent_factory: AgentFactory,
     read: Reader = input,
     write: Writer = print,
-    max_turns: int = _MAX_TURNS,
+    max_turns: int = MAX_INTAKE_TURNS,
+    skip_hint: str = "(press Enter to skip any question)",
 ) -> Query:
     """Free-form conversational intake: chat until the concierge has enough.
 
     A fresh agent per turn reasons over the whole transcript and returns an
     ``IntakeState`` (its next `reply` + extracted slots + a `done` flag).
+
+    ``skip_hint`` is caller-supplied because how you skip a question depends on
+    the front-end: a terminal takes a blank line, Telegram can't send one.
     """
     write(
         "🛍  Shopping Concierge — tell me what you're after.\n"
-        "   (press Enter to skip any question)\n"
+        + (f"   {skip_hint}\n" if skip_hint else "")
     )
 
     transcript: list[str] = []

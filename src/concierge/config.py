@@ -35,6 +35,10 @@ class Settings:
     llm_model: str = "anthropic/claude-opus-4-8"
     mcp_endpoint: str = "https://catalog.shopify.com/api/ucp/mcp"
     auth_endpoint: str = "https://api.shopify.com/auth/access_token"
+    # Telegram is opt-in: only required when running with --telegram, which
+    # validates them itself (see telegram.require_telegram_settings).
+    telegram_bot_token: str | None = None
+    telegram_allowed_chat_ids: tuple[str, ...] = ()
 
     @classmethod
     def load(cls, env_file: str | None = None) -> Settings:
@@ -81,5 +85,19 @@ class Settings:
             ),
             auth_endpoint=os.environ.get(
                 "AUTH_ENDPOINT", "https://api.shopify.com/auth/access_token"
+            ),
+            # Stripped like the chat ids below: a token pasted from BotFather
+            # with a trailing newline is truthy, so it survives
+            # require_telegram_settings and fails much later as an opaque 404
+            # from getUpdates. The trailing `or None` keeps a whitespace-only
+            # value failing loud there instead of becoming a one-space token.
+            telegram_bot_token=(os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+            or None,
+            telegram_allowed_chat_ids=tuple(
+                chat_id.strip()
+                for chat_id in os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "").split(
+                    ","
+                )
+                if chat_id.strip()
             ),
         )

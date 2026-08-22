@@ -8,14 +8,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from concierge.constants import DEFAULT_SEARCH_LIMIT
 from concierge.mcp_client import McpClient
 from concierge.models import Product, Query
 
-# Default number of products to request per search.
-_DEFAULT_LIMIT = 10
 
-
-def query_to_arguments(query: Query, limit: int = _DEFAULT_LIMIT) -> dict[str, Any]:
+def query_to_arguments(
+    query: Query, limit: int = DEFAULT_SEARCH_LIMIT
+) -> dict[str, Any]:
     """Build ``search_catalog`` arguments from a Query.
 
     The search parameters nest under a ``catalog`` key (per the live request
@@ -51,7 +51,7 @@ def extract_products(result: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def search(
-    query: Query, client: McpClient, limit: int = _DEFAULT_LIMIT
+    query: Query, client: McpClient, limit: int = DEFAULT_SEARCH_LIMIT
 ) -> list[Product]:
     """Run a catalog search and return normalized products."""
     result = client.search_catalog(query_to_arguments(query, limit=limit))

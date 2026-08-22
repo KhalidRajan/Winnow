@@ -7,7 +7,7 @@ import logging
 import re
 import sys
 
-from concierge import formatting, interactive, workflow
+from concierge import formatting, interactive, telegram, workflow
 from concierge.agents.intake import build_intake_agent
 from concierge.auth import TokenProvider
 from concierge.config import ConfigError, Settings
@@ -65,9 +65,51 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--team",
         action="store_true",
-        help="use an Agno Team to coordinate + synthesize instead of deterministic consensus",
+        help=(
+            "use an Agno Team to coordinate + synthesize "
+            "instead of deterministic consensus"
+        ),
+    )
+    parser.add_argument(
+        "--telegram",
+        action="store_true",
+        help="serve the concierge over Telegram (long-polling, allowlisted chats)",
     )
     return parser
+
+
+def run_telegram(
+    settings: Settings, client: McpClient, model: object, args: argparse.Namespace
+) -> int:
+    """Serve the same pipeline over a Telegram chat (long-polling, allowlisted)."""
+    # Validate before announcing anything, so a misconfigured bot never prints
+    # "running" and then dies.
+    _, allowed = telegram.require_telegram_settings(settings)
+
+    def handle(session: telegram.ChatSession) -> None:
+        query = interactive.collect_query_llm(
+            lambda: build_intake_agent(model),
+            read=session.read,
+            write=session.write,
+            skip_hint=f'(send "{telegram.SKIP_TOKEN}" to skip any question)',
+        )
+        recommendations = workflow.run(
+            query,
+            client,
+            model=model,
+            use_llm=True,
+            use_team=args.team,
+            top_n=args.top,
+            debate_rounds=args.debate,
+        )
+        session.write_html(formatting.render_telegram(recommendations))
+
+    print(
+        f"Telegram bot running for chat(s) {', '.join(sorted(allowed))} "
+        "— Ctrl-C to stop. Message your bot to start."
+    )
+    telegram.run_bot(settings, handle)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -77,6 +119,12 @@ def main(argv: list[str] | None = None) -> int:
     # recovers, which garbles the conversation. Our own failures surface as
     # exceptions (ConfigError, McpError, TeamError), so silence its logger.
     logging.getLogger("agno").setLevel(logging.CRITICAL)
+    # httpx logs every request line at INFO, and the Telegram bot token lives in
+    # the request path (`/bot<TOKEN>/getUpdates`). Its logger is already at INFO,
+    # so the only thing withholding the credential today is that nothing has
+    # attached a handler — one logging.basicConfig() anywhere would start
+    # writing the token to the operator's log once per poll, forever.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     try:
         settings = Settings.load()
@@ -86,6 +134,23 @@ def main(argv: list[str] | None = None) -> int:
 
     client = McpClient(settings, TokenProvider(settings))
     model = None if args.no_llm else build_model(settings)
+
+    if args.telegram:
+        if model is None:
+            print("The Telegram bot needs a model — drop --no-llm.", file=sys.stderr)
+            return 1
+        try:
+            return run_telegram(settings, client, model, args)
+        except ConfigError as exc:
+            print(f"Configuration error: {exc}", file=sys.stderr)
+            return 1
+        except telegram.TelegramError as exc:
+            print(f"Telegram bot stopped: {exc}", file=sys.stderr)
+            return 1
+        except KeyboardInterrupt:
+            # The startup banner tells the operator to stop with Ctrl-C.
+            print("\nStopped.", file=sys.stderr)
+            return 0
 
     if args.interactive:
         if model is None:

@@ -1,0 +1,699 @@
+import pytest
+
+from concierge.config import ConfigError, Settings
+from concierge.enums import AgentName
+from concierge.formatting import render_telegram
+from concierge.models import AgentScore, Product, Recommendation
+from concierge.telegram import (
+    _DEFAULT_RETRY_AFTER,
+    _EMPTY_POLL_PAUSE,
+    _MAX_MESSAGE,
+    _MAX_RATE_LIMIT_RETRIES,
+    _POLL_TIMEOUT,
+    ChatSession,
+    TelegramClient,
+    TelegramError,
+    _Inbox,
+    chunk,
+    require_telegram_settings,
+    run_bot,
+)
+
+ALLOWED = "111"
+STRANGER = "999"
+
+
+def _settings(token="tok", chat_ids=(ALLOWED,)):
+    return Settings(
+        shopify_client_id="cid",
+        shopify_client_secret="secret",
+        agent_profile_url="https://example.com/profile.json",
+        llm_api_key="key",
+        telegram_bot_token=token,
+        telegram_allowed_chat_ids=chat_ids,
+    )
+
+
+def _update(update_id, chat_id, text):
+    return {"update_id": update_id, "message": {"chat": {"id": chat_id}, "text": text}}
+
+
+class FakeClient:
+    """Stands in for TelegramClient: scripted update batches, captured sends."""
+
+    def __init__(self, batches=()):
+        self.batches = list(batches)
+        self.sent = []
+        self.offsets = []
+        self.parse_modes = []
+
+    def get_updates(self, offset):
+        self.offsets.append(offset)
+        return self.batches.pop(0) if self.batches else []
+
+    def send_message(self, chat_id, text, parse_mode=None):
+        self.sent.append((chat_id, text))
+        self.parse_modes.append(parse_mode)
+
+    def drop_pending(self):
+        return None
+
+
+class _RecordingHttp:
+    """Captures the raw Bot API payloads TelegramClient posts."""
+
+    def __init__(self, results=None):
+        self.calls = []
+        self._results = list(results or [])
+
+    def post(self, url, json):
+        self.calls.append((url.rsplit("/", 1)[-1], json))
+        payload = self._results.pop(0) if self._results else []
+
+        class _Response:
+            status_code = 200
+            text = "{}"
+
+            @staticmethod
+            def json():
+                return {"ok": True, "result": payload}
+
+        return _Response()
+
+    def close(self):
+        pass
+
+
+# --- config ---
+
+
+def test_require_settings_reports_every_missing_var():
+    with pytest.raises(ConfigError) as exc:
+        require_telegram_settings(_settings(token=None, chat_ids=()))
+    message = str(exc.value)
+    assert "TELEGRAM_BOT_TOKEN" in message
+    assert "TELEGRAM_ALLOWED_CHAT_IDS" in message
+
+
+def test_require_settings_rejects_empty_allowlist():
+    """An unconfigured allowlist must refuse to start, not serve everyone."""
+    with pytest.raises(ConfigError):
+        require_telegram_settings(_settings(chat_ids=()))
+
+
+def test_require_settings_returns_token_and_allowlist():
+    token, allowed = require_telegram_settings(_settings())
+    assert token == "tok"
+    assert allowed == frozenset({ALLOWED})
+
+
+# --- allowlist ---
+
+
+def test_stranger_messages_are_ignored_silently():
+    client = FakeClient([[_update(1, STRANGER, "hello?"), _update(2, ALLOWED, "hi")]])
+    inbox = _Inbox()
+    allowed = frozenset({ALLOWED})
+
+    assert inbox.next_message(client, allowed) == (ALLOWED, "hi")  # stranger dropped
+    assert inbox.next_message(client, allowed) is None  # nothing else queued
+    assert client.sent == []  # and never replied to
+
+
+def test_offset_advances_past_every_update():
+    client = FakeClient([[_update(7, STRANGER, "x"), _update(8, ALLOWED, "y")]])
+    inbox = _Inbox()
+    inbox.next_message(client, frozenset({ALLOWED}))
+    # advances past the stranger too, so it isn't re-fetched forever
+    assert inbox.offset == 9
+
+
+def test_non_text_updates_are_skipped():
+    client = FakeClient([[{"update_id": 1, "message": {"chat": {"id": ALLOWED}}}]])
+    assert _Inbox().next_message(client, frozenset({ALLOWED})) is None
+
+
+def test_inbox_keeps_messages_it_was_not_asked_for():
+    """A poll for one chat must not destroy another chat's messages."""
+    client = FakeClient([[_update(1, STRANGER, "mine"), _update(2, ALLOWED, "yours")]])
+    inbox = _Inbox()
+    allowed = frozenset({ALLOWED, STRANGER})
+
+    # ask for ALLOWED first — STRANGER's message arrived in the same batch
+    assert inbox.next_message(client, allowed, chat_id=ALLOWED) == (ALLOWED, "yours")
+    # ...and is still there afterwards, without another poll
+    assert inbox.next_message(client, allowed, chat_id=STRANGER) == (STRANGER, "mine")
+
+
+# --- chunking ---
+
+
+def test_short_text_is_one_chunk():
+    assert chunk("hello", limit=100) == ["hello"]
+
+
+def test_long_text_splits_on_line_boundaries():
+    text = "\n".join(f"line {i}" for i in range(100))
+    pieces = chunk(text, limit=50)
+    assert len(pieces) > 1
+    assert all(len(p) <= 50 for p in pieces)
+    assert "".join(pieces) == text  # nothing lost
+
+
+def test_single_overlong_line_is_hard_split():
+    pieces = chunk("x" * 250, limit=100)
+    assert [len(p) for p in pieces] == [100, 100, 50]
+
+
+# --- session ---
+
+
+def test_session_replays_first_message_then_polls():
+    client = FakeClient([[_update(2, ALLOWED, "second")]])
+    session = ChatSession(client, ALLOWED, "first", _Inbox(), frozenset({ALLOWED}))
+
+    assert session.read() == "first"  # the message that opened the chat
+    assert session.read() == "second"  # then long-polls
+
+
+def test_session_write_sends_and_skips_blanks():
+    client = FakeClient()
+    session = ChatSession(client, ALLOWED, "hi", _Inbox(), frozenset({ALLOWED}))
+
+    session.write("hello")
+    session.write("   ")  # the intake loop writes blanks on EOF
+    assert client.sent == [(ALLOWED, "hello")]
+
+
+def test_session_read_times_out_as_eof():
+    """A shopper who goes quiet ends intake via the existing EOF path."""
+    ticks = iter([0.0, 0.0, 999.0])
+    session = ChatSession(
+        FakeClient(),
+        ALLOWED,
+        "hi",
+        _Inbox(),
+        frozenset({ALLOWED}),
+        timeout=10.0,
+        clock=lambda: next(ticks),
+    )
+    session.read()  # consumes the seeded first message
+    with pytest.raises(EOFError):
+        session.read()
+
+
+# --- bot loop ---
+
+
+def test_run_bot_hands_each_conversation_to_the_handler():
+    client = FakeClient([[_update(1, ALLOWED, "I need a jacket")]])
+    seen = []
+
+    def handle(session):
+        seen.append(session.read())
+        session.write("on it")
+
+    run_bot(_settings(), handle, client=client, drop_pending=False, max_conversations=1)
+
+    assert seen == ["I need a jacket"]
+    assert client.sent == [(ALLOWED, "on it")]
+
+
+def test_run_bot_survives_a_failing_conversation():
+    client = FakeClient([[_update(1, ALLOWED, "boom")]])
+
+    def handle(session):
+        raise ValueError("scoring blew up")
+
+    run_bot(_settings(), handle, client=client, drop_pending=False, max_conversations=1)
+
+    # the shopper is told, and the bot stays alive
+    assert client.sent and "went wrong" in client.sent[0][1]
+
+
+def test_a_burst_of_messages_reaches_one_conversation():
+    """ "hi" then "waterproof jacket" in one batch must not become two chats."""
+    client = FakeClient(
+        [[_update(1, ALLOWED, "hi"), _update(2, ALLOWED, "waterproof jacket")]]
+    )
+    seen = []
+
+    def handle(session):
+        seen.append(session.read())
+        seen.append(session.read())  # the rest of the burst, not a fresh poll
+
+    run_bot(_settings(), handle, client=client, drop_pending=False, max_conversations=1)
+
+    assert seen == ["hi", "waterproof jacket"]
+
+
+def test_a_read_leaves_another_chats_message_queued():
+    """A poll inside one conversation used to silently discard other chats."""
+    allowed = frozenset({ALLOWED, STRANGER})
+    inbox = _Inbox()
+    client = FakeClient([[_update(2, STRANGER, "me too")]])
+    ticks = iter([0.0, 0.0, 999.0])
+    session = ChatSession(
+        client,
+        ALLOWED,
+        "hi",
+        inbox,
+        allowed,
+        timeout=10.0,
+        clock=lambda: next(ticks),
+    )
+
+    assert session.read() == "hi"
+    with pytest.raises(EOFError):
+        session.read()  # polls, finds only STRANGER's message, gives up waiting
+
+    # ...and STRANGER's message survived that poll, ready for the next conversation
+    assert inbox.next_message(client, allowed) == (STRANGER, "me too")
+
+
+def test_a_transient_poll_failure_is_retried_not_fatal():
+    class FlakyClient(FakeClient):
+        def __init__(self):
+            super().__init__([[_update(1, ALLOWED, "hi")]])
+            self.attempts = 0
+
+        def get_updates(self, offset):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise TelegramError("connection reset")
+            return super().get_updates(offset)
+
+    client = FlakyClient()
+    seen = []
+    run_bot(
+        _settings(),
+        lambda s: seen.append(s.read()),
+        client=client,
+        drop_pending=False,
+        max_conversations=1,
+        sleep=lambda _seconds: None,
+    )
+
+    assert seen == ["hi"]  # rode out the blip
+
+
+def test_a_dead_transport_eventually_gives_up():
+    class DeadClient(FakeClient):
+        def get_updates(self, offset):
+            raise TelegramError("network unreachable")
+
+    with pytest.raises(TelegramError, match="consecutive polling failures"):
+        run_bot(
+            _settings(),
+            lambda s: None,
+            client=DeadClient(),
+            drop_pending=False,
+            sleep=lambda _seconds: None,
+        )
+
+
+def test_a_failing_apology_does_not_kill_the_bot():
+    """If the error reply itself fails to send, keep serving."""
+
+    class UnsendableClient(FakeClient):
+        def send_message(self, chat_id, text, parse_mode=None):
+            raise TelegramError("sendMessage returned 403")
+
+    client = UnsendableClient([[_update(1, ALLOWED, "boom")]])
+
+    def handle(session):
+        raise ValueError("scoring blew up")
+
+    # must return normally rather than propagating the TelegramError
+    run_bot(_settings(), handle, client=client, drop_pending=False, max_conversations=1)
+
+
+def test_skip_token_reads_as_the_blank_line_intake_expects():
+    client = FakeClient([[_update(2, ALLOWED, "SKIP ")]])
+    session = ChatSession(client, ALLOWED, "hi", _Inbox(), frozenset({ALLOWED}))
+
+    assert session.read() == "hi"
+    assert session.read() == ""  # intake treats blank as "skip this question"
+
+
+# --- telegram rendering ---
+
+
+def _recommendation(title, url, price, tradeoffs=(), reasoning="", currency="USD"):
+    return Recommendation(
+        product=Product(upid="a", title=title, price=price, currency=currency, url=url),
+        final_score=0.82,
+        per_agent=[
+            AgentScore(
+                agent=AgentName.BUDGET,
+                product_upid="a",
+                score=1.0,
+                reasons=["cheapest"],
+            ),
+            AgentScore(
+                agent=AgentName.LOGISTICS,
+                product_upid="a",
+                score=0.65,
+                reasons=["in stock"],
+            ),
+        ],
+        tradeoffs=list(tradeoffs),
+        reasoning=reasoning,
+    )
+
+
+def test_telegram_render_links_the_title_instead_of_dumping_the_url():
+    out = render_telegram(
+        [_recommendation("Oud Candle", "https://shop/p?a=1&b=2", 25.5)]
+    )
+    assert '<a href="https://shop/p?a=1&amp;b=2">Oud Candle</a>' in out
+    assert "\nhttps://shop" not in out  # no bare URL on its own line
+    assert "█" not in out  # no terminal bars
+
+
+def test_telegram_render_escapes_html_in_titles_and_reasons():
+    out = render_telegram([_recommendation("Tom & Jerry <b>", "https://x", 10.0)])
+    assert "Tom &amp; Jerry &lt;b&gt;" in out
+
+
+def test_telegram_render_includes_scores_and_tradeoffs():
+    out = render_telegram(
+        [_recommendation("X", "https://x", 10.0, ["budget vs logistics"])]
+    )
+    assert "budget 1.00" in out and "logistics 0.65" in out
+    assert "⚖️" in out and "budget vs logistics" in out
+
+
+def test_telegram_render_includes_the_consensus_reasoning():
+    """The synthesis line is the most valuable one — the terminal prints it too."""
+    out = render_telegram(
+        [_recommendation("X", "https://x", 10.0, reasoning="Best value & in stock")]
+    )
+    assert "Best value &amp; in stock" in out
+
+
+def test_write_html_uses_html_parse_mode():
+    client = FakeClient()
+    session = ChatSession(client, ALLOWED, "hi", _Inbox(), frozenset({ALLOWED}))
+
+    session.write_html("<b>hi</b>")
+    session.write("plain")
+
+    assert client.parse_modes == ["HTML", None]
+
+
+# --- regressions found in review ---
+
+
+def test_apology_never_repeats_the_exception_text():
+    """Pipeline errors quote upstream response bodies; a chat message is forever."""
+    client = FakeClient([[_update(1, ALLOWED, "hi")]])
+
+    def handle(session):
+        raise RuntimeError("Token response missing 'access_token': {'secret': 'oops'}")
+
+    run_bot(_settings(), handle, client=client, drop_pending=False, max_conversations=1)
+
+    apology = client.sent[-1][1]
+    assert "access_token" not in apology and "oops" not in apology
+    assert "went wrong" in apology
+
+
+def test_session_read_rides_out_a_transient_poll_failure():
+    """A blip mid-intake must not discard a conversation already under way."""
+
+    class FlakyClient(FakeClient):
+        def get_updates(self, offset):
+            if not self.offsets:  # fail the first poll only
+                self.offsets.append(offset)
+                raise TelegramError("getUpdates failed: connection reset")
+            return super().get_updates(offset)
+
+    client = FlakyClient([[_update(2, ALLOWED, "a waterproof one")]])
+    slept = []
+    session = ChatSession(
+        client,
+        ALLOWED,
+        "hi",
+        _Inbox(),
+        frozenset({ALLOWED}),
+        sleep=slept.append,
+    )
+
+    assert session.read() == "hi"
+    assert session.read() == "a waterproof one"
+    assert slept  # backed off rather than aborting the conversation
+
+
+def test_session_read_gives_up_after_persistent_poll_failures():
+    class DeadClient(FakeClient):
+        def get_updates(self, offset):
+            raise TelegramError("getUpdates failed: connection reset")
+
+    session = ChatSession(
+        DeadClient(),
+        ALLOWED,
+        "hi",
+        _Inbox(),
+        frozenset({ALLOWED}),
+        sleep=lambda _: None,
+    )
+    session.read()
+    with pytest.raises(TelegramError):
+        session.read()
+
+
+def test_telegram_render_escapes_the_catalog_supplied_currency():
+    out = render_telegram([_recommendation("X", "https://x", 10.0, currency="<b>USD")])
+    assert "&lt;b&gt;USD" in out and "<b>USD" not in out
+
+
+def test_telegram_render_keeps_every_line_chunkable():
+    """No rendered line may exceed the chunk limit, or a split lands mid-tag.
+
+    The filler is apostrophes deliberately: ``html.escape`` turns each into
+    ``&#x27;``, so a field bounded *before* escaping still renders six times over
+    the limit. Inert filler such as ``"T" * 5000`` satisfies this assertion even
+    when the bound is applied in the wrong place, which is how it passed while
+    the renderer was producing 4210-character lines.
+    """
+    out = render_telegram(
+        [
+            _recommendation(
+                "'" * 5000,
+                "https://x/" + "'" * 5000,
+                10.0,
+                tradeoffs=["'" * 5000],
+                reasoning="'" * 5000,
+            )
+        ]
+    )
+    assert "&#x27;" in out  # the filler really did expand under escaping
+    assert all(len(line) <= _MAX_MESSAGE for line in out.splitlines())
+
+
+def test_telegram_chunks_split_between_complete_elements():
+    """A shortlist long enough to need several chunks keeps every tag balanced."""
+    out = render_telegram([_recommendation("'" * 400, "https://x", 10.0)] * 12)
+    pieces = chunk(out)
+    assert len(pieces) > 1  # the properties below are vacuous on a single chunk
+    for piece in pieces:
+        assert piece.count("<b>") == piece.count("</b>")
+        assert piece.count("<i>") == piece.count("</i>")
+        assert "&#x2" not in piece[-6:]  # no half-written entity at a boundary
+
+
+def test_drop_pending_drains_without_long_polling():
+    """A long-poll here stalls startup and eats the first message sent after it."""
+    http = _RecordingHttp()
+    TelegramClient("tok", http_client=http).drop_pending()
+
+    method, payload = http.calls[0]
+    assert method == "getUpdates"
+    assert payload["offset"] == -1
+    assert payload["timeout"] == 0  # not _POLL_TIMEOUT
+
+
+def test_normal_polling_still_uses_the_long_poll_timeout():
+    """Only the startup drain is non-blocking; ordinary polls still wait."""
+    http = _RecordingHttp()
+    TelegramClient("tok", http_client=http).get_updates(offset=7)
+
+    assert http.calls[0][1]["timeout"] == _POLL_TIMEOUT
+
+
+def test_an_empty_poll_pauses_before_polling_again():
+    """Without this a stranger's traffic spins the loop into the rate limiter."""
+    # Empty batches stand in for updates that were drained and then filtered out
+    # because the chat is not allowlisted.
+    client = FakeClient([[], [], [_update(1, ALLOWED, "hi")]])
+    slept = []
+    run_bot(
+        _settings(),
+        lambda session: session.read(),
+        client=client,
+        drop_pending=False,
+        max_conversations=1,
+        sleep=slept.append,
+    )
+
+    assert slept == [_EMPTY_POLL_PAUSE, _EMPTY_POLL_PAUSE]
+
+
+# --- round-2 regressions: the error taxonomy at the Bot API seam ---
+
+
+class _StubResponse:
+    def __init__(self, status_code, text, payload, raises):
+        self.status_code = status_code
+        self.text = text
+        self._payload = payload
+        self._raises = raises
+
+    def json(self):
+        if self._raises:
+            raise ValueError("Expecting value: line 1 column 1 (char 0)")
+        return self._payload
+
+
+class _ScriptedHttp:
+    """Posts a fixed status/body, so _call's error taxonomy can be exercised."""
+
+    def __init__(self, status_code=200, text="{}", payload=None, raises_json=False):
+        self.calls = 0
+        self._response = _StubResponse(status_code, text, payload, raises_json)
+
+    def post(self, url, json):
+        self.calls += 1
+        return self._response
+
+    def close(self):
+        pass
+
+
+def test_a_non_json_200_becomes_a_telegram_error():
+    """A captive portal answers 200 with HTML.
+
+    json.JSONDecodeError is a ValueError, which neither poll loop catches, so
+    before this it escaped run_bot entirely and killed a days-long bot on the
+    first blip instead of counting against the retry budget.
+    """
+    client = TelegramClient(
+        "tok", http_client=_ScriptedHttp(text="<html>portal</html>", raises_json=True)
+    )
+    with pytest.raises(TelegramError) as exc:
+        client.get_updates(offset=None)
+    assert "non-JSON" in str(exc.value)
+    # The page itself must not be pasted into the error, which the poll loop logs.
+    assert "portal" not in str(exc.value)
+
+
+def test_a_json_body_that_is_not_an_object_becomes_a_telegram_error():
+    client = TelegramClient("tok", http_client=_ScriptedHttp(payload=["ok"]))
+    with pytest.raises(TelegramError, match="not a JSON object"):
+        client.get_updates(offset=None)
+
+
+def test_get_updates_rejects_a_result_that_is_not_a_list():
+    """list({...}) would silently yield key strings and blow up later in _Inbox."""
+    client = TelegramClient(
+        "tok", http_client=_ScriptedHttp(payload={"ok": True, "result": {"a": 1}})
+    )
+    with pytest.raises(TelegramError, match="not a list"):
+        client.get_updates(offset=None)
+
+
+def test_an_update_without_an_update_id_is_skipped_not_fatal():
+    inbox = _Inbox()
+    client = FakeClient([[{"message": {"chat": {"id": ALLOWED}, "text": "hi"}}]])
+    assert inbox.next_message(client, frozenset({ALLOWED})) is None
+    assert inbox.offset is None
+
+
+def test_rate_limit_exhaustion_reports_giving_up_rather_than_the_raw_status():
+    """The final 429 used to fall through to the generic status check.
+
+    That told the operator "returned 429" — indistinguishable from a single
+    unexpected throttle — and made the exhaustion message dead code.
+    """
+    http = _ScriptedHttp(
+        status_code=429,
+        text='{"ok":false,"error_code":429}',
+        payload={"ok": False, "error_code": 429, "parameters": {"retry_after": 0}},
+    )
+    slept = []
+    client = TelegramClient("tok", http_client=http, sleep=slept.append)
+    with pytest.raises(TelegramError, match="still rate-limited"):
+        client.get_updates(offset=None)
+    assert http.calls == _MAX_RATE_LIMIT_RETRIES + 1
+    assert len(slept) == _MAX_RATE_LIMIT_RETRIES
+
+
+def test_session_read_pauses_when_a_poll_yields_nothing_for_this_chat():
+    """Occurrence 2 of the stranger-flood spin: run_bot was fixed, read was not.
+
+    A stranger's updates come back immediately and are dropped, so without the
+    pause this loop re-polls at network speed for as long as they keep sending.
+    """
+    client = FakeClient(
+        [[_update(1, STRANGER, "spam")], [_update(2, STRANGER, "spam")]]
+    )
+    slept = []
+    session = ChatSession(
+        client,
+        ALLOWED,
+        "hi",
+        _Inbox(),
+        frozenset({ALLOWED}),
+        timeout=10.0,
+        clock=iter([0.0, 1.0, 2.0, 99.0]).__next__,
+        sleep=slept.append,
+    )
+
+    assert session.read() == "hi"  # the pending first message, no polling
+    with pytest.raises(EOFError):
+        session.read()
+
+    assert slept == [_EMPTY_POLL_PAUSE, _EMPTY_POLL_PAUSE]
+
+
+def test_a_retry_after_body_that_is_not_an_object_falls_back_to_the_default():
+    """_retry_after guarded the decode but not the shape; a JSON null raised."""
+    http = _ScriptedHttp(status_code=429, text="null", payload=None)
+    slept = []
+    client = TelegramClient("tok", http_client=http, sleep=slept.append)
+    with pytest.raises(TelegramError, match="still rate-limited"):
+        client.get_updates(offset=None)
+    assert slept == [_DEFAULT_RETRY_AFTER] * _MAX_RATE_LIMIT_RETRIES
+
+
+def test_a_non_web_url_is_rendered_as_plain_text_not_a_link():
+    """Telegram 400s the whole message on an href scheme it will not parse."""
+    out = render_telegram([_recommendation("Candle", "javascript:alert(1)", 25.0)])
+    assert "<a href=" not in out
+    assert "javascript:" not in out
+    assert "Candle" in out
+
+
+def test_a_web_url_is_still_wrapped_in_a_link():
+    out = render_telegram([_recommendation("Candle", "https://shop/p", 25.0)])
+    assert '<a href="https://shop/p">' in out
+
+
+def test_bot_token_is_stripped(monkeypatch):
+    """A token pasted with a trailing newline is truthy, so it fails much later."""
+    for name in ("SHOPIFY_CLIENT_ID", "SHOPIFY_CLIENT_SECRET", "LLM_API_KEY"):
+        monkeypatch.setenv(name, "x")
+    monkeypatch.setenv("AGENT_PROFILE_URL", "https://example.com/profile.json")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "  123:abc\n")
+    assert Settings.load().telegram_bot_token == "123:abc"
+
+
+def test_a_whitespace_only_bot_token_still_fails_loud(monkeypatch):
+    for name in ("SHOPIFY_CLIENT_ID", "SHOPIFY_CLIENT_SECRET", "LLM_API_KEY"):
+        monkeypatch.setenv(name, "x")
+    monkeypatch.setenv("AGENT_PROFILE_URL", "https://example.com/profile.json")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "   ")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", ALLOWED)
+    with pytest.raises(ConfigError, match="TELEGRAM_BOT_TOKEN"):
+        require_telegram_settings(Settings.load())
